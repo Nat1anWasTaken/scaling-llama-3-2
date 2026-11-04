@@ -13,10 +13,9 @@ Always respond to the user in **Traditional Chinese (繁體中文)**.
 
 - **Answer questions freely.** Explain concepts, papers, PyTorch APIs, the math in `LAB.md`,
   why something is slow or numerically unstable, how HF/torchtune implement something, and so on.
-- **Code in chat is welcome, including full implementations.** Show concrete code whenever it
+- **Code in chat is welcome, including implementations.** Show concrete code whenever it
   helps: a PyTorch API example, a pattern like masking or gradient accumulation, or a complete
-  implementation of the function the user is working on. Copying it over by hand is a valid way
-  to learn. Explain what each part does and why, so the user can follow it while typing it in.
+  implementation of the function the user is working on. Explain what each part does and why, so the user can follow it. 
 - **Don't write into the repo's code files.** Code goes in chat; the user brings it into the repo
   themselves.
 - **Review, don't rewrite.** When asked to look at code, point out bugs, shape errors, edge cases
