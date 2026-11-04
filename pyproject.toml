@@ -16,3 +16,12 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu" }]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.3",
+    "ty>=0.0.97",
+]
+
+[tool.ruff.lint]
+extend-select = ["ANN", "N"]
