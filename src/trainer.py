@@ -1,11 +1,13 @@
 from collections.abc import Iterable
 from dataclasses import InitVar, dataclass
-from typing import Protocol, TypedDict
+from typing import Protocol
 
-from torch.fft import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel
+
+from .data import Batch
+from .loss import CausalLMLossSum
 
 
 @dataclass
@@ -31,17 +33,6 @@ class TrainerState:
         raise NotImplementedError
 
     # TODO: extend this to include optimizer, scheduler, rng state.
-
-
-class Batch(TypedDict):
-    input_ids: Tensor
-    labels: Tensor
-    position_ids: Tensor
-
-
-class CausalLMLossSum(Protocol):
-    def __call__(self, logits: Tensor, labels: Tensor) -> tuple[Tensor, Tensor]:
-        raise NotImplementedError
 
 
 @dataclass
