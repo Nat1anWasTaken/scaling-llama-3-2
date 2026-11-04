@@ -4,8 +4,6 @@ A mostly handwritten training stack for Llama 3.2–style language models. We us
 
 The stack is meant to outlive this lab. Both members of the pair should be able to explain every component: model, optimizer, data loading, packing, loss and checkpointing.
 
-> **Status:** early scaffolding. The interfaces and architecture are defined below, and most components are not implemented yet. See [Components](#components) for each component's status.
-
 ---
 
 ## Architecture
