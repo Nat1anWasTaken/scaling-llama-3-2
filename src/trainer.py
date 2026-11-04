@@ -72,7 +72,7 @@ class Trainer:
         ckpt: Checkpointer,
         logger: Logger,
         cfg: TrainingConfig,
-    ):
+    ) -> None:
         raise NotImplementedError()
 
     def train(self) -> None:
