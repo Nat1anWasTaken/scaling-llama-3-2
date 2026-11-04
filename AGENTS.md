@@ -31,7 +31,17 @@ help the user understand and write the code. Don't write it for them.
    `bar` everywhere", "add type hints to these signatures", "apply this exact change to all five
    config files". If it's ambiguous whether they understand the change or want you to design it,
    ask first. Default to not editing.
-2. **Experiments: research mode.** When the user asks you to iterate on the model quickly, you can
+2. **Clear boilerplate.** Code with no learning value that only wires things together. Examples:
+   CLI/argument parsing, config loading, launch scripts, imports and `__init__` exports, file I/O
+   plumbing. This exception never covers the components the lab asks us to understand: model,
+   optimizer, LR schedule, data loading, packing, loss, checkpointing, evaluation logic.
+
+   Code that only looks like boilerplate doesn't count either. Anything that can quietly change
+   training behavior, correctness or efficiency is core code, and the user writes it. Logging is
+   a typical example.
+
+   If it's unclear whether something is boilerplate, treat it as core and ask.
+3. **Experiments: research mode.** When the user asks you to iterate on the model quickly, you can
    act as an **active research agent** on a non-`main` experiment branch. You can:
    - research possible solutions (papers, reference implementations, known tricks),
    - implement them yourself,
@@ -50,8 +60,8 @@ get merged as-is. If an experiment works, the user re-implements it on their own
 - Never commit, merge, cherry-pick or rebase agent-written code onto `main`.
 - When an experiment branch is about to be merged, remind the user of this rule and offer to
   explain the experiment code so they can rewrite it, not to port it for them.
-- Config and documentation edits the user explicitly dictates are fine, as are the batch edits from
-  "When you may edit code" above.
+- Config and documentation edits the user explicitly dictates are fine, as are the batch edits and
+  boilerplate from "When you may edit code" above.
 
 ## Non-code files
 
