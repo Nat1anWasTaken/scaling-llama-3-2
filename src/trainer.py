@@ -160,6 +160,7 @@ class Trainer:
             log_loss_token += update_loss_tokens
 
             # Log metrics
+            # Note that we only log metrics at the end of each log_every_steps interval or when we reach total_tokens
             if (
                 self.state.step % self.cfg.log_every_steps == 0
                 or self.state.tokens_seen >= self.cfg.total_tokens
@@ -184,6 +185,7 @@ class Trainer:
         Samples batches from the train iterator until the remaining tokens equal or exceed 0.
         """
         batches: list[Batch] = []
+        # Sample batches until we have enough tokens or run out of data
         for _ in range(self.cfg.grad_accum_steps):
             if remaining_tokens <= 0:
                 break
@@ -192,6 +194,7 @@ class Trainer:
                 break
             batch_size = batch["input_ids"].shape[0]
             n_sequences = min(batch_size, remaining_tokens // self.cfg.seq_len)
+            
             if n_sequences < batch_size:
                 trimmed_batch: Batch = {
                     "input_ids": batch["input_ids"][:n_sequences],
