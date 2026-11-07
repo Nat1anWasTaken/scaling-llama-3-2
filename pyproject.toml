@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "pyarrow>=26.0.1",
+    "pylance>=14.0.2",
     "torch>=2.15.0",
     "transformers>=5.22.1",
 ]
