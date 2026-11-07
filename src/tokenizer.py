@@ -1,14 +1,88 @@
+import json
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import lance
 import numpy
+import pyarrow.fs
 import pyarrow.parquet
 from huggingface_hub import snapshot_download
 from lance import LanceDataset
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from .data import TokenArray
+
+type Offsets = numpy.ndarray[tuple[int], numpy.dtype[numpy.int64]]
+
+
+class ShardStore:
+    def __init__(self, uri: str) -> None:
+        if "://" not in uri:
+            uri = str(Path(uri).absolute())
+
+        self.uri = uri
+
+        filesystem, root = pyarrow.fs.FileSystem.from_uri(uri)
+
+        self.filesystem: pyarrow.fs.FileSystem = filesystem
+        self.root = PurePosixPath(root)
+
+    def has_shard(self, name: str) -> bool:
+        return self._is_file(self._path(name, "offsets.npy"))
+
+    def read_offsets(self, name: str) -> Offsets:
+        return self._load(self._path(name, "offsets.npy"))
+
+    def read_tokens(self, name: str) -> TokenArray:
+        return self._load(self._path(name, "tokens.npy"))
+
+    def write_shard(self, name: str, tokens: TokenArray, offsets: Offsets) -> None:
+        self.filesystem.create_dir(str(self._path(name)), recursive=True)
+        self._save(self._path(name, "tokens.npy"), tokens)
+
+        # Commit point: offsets.npy only appears once it is fully written
+        temporary_path = self._path(name, "offsets.npy.tmp")
+        self._save(temporary_path, offsets)
+        self.filesystem.move(str(temporary_path), str(self._path(name, "offsets.npy")))
+
+    def read_json(self, name: str) -> dict[str, object] | None:
+        path = self._path(name)
+
+        if not self._is_file(path):
+            return None
+
+        with self.filesystem.open_input_stream(str(path)) as stream:
+            return json.loads(stream.read())
+
+    def write_json(self, name: str, content: dict[str, object]) -> None:
+        self.filesystem.create_dir(str(self.root), recursive=True)
+
+        temporary_path = self._path(name + ".tmp")
+
+        with self.filesystem.open_output_stream(str(temporary_path)) as stream:
+            stream.write(json.dumps(content, indent=2).encode())
+
+        self.filesystem.move(str(temporary_path), str(self._path(name)))
+
+    # Paths stay PurePosixPath inside the class; the damn pyarrow only accepts str, so
+    # convert with str() right at each pyarrow call
+
+    def _path(self, *parts: str) -> PurePosixPath:
+        return self.root.joinpath(*parts)
+
+    def _is_file(self, path: PurePosixPath) -> bool:
+        # A missing path doesn't raise, it reports FileType.NotFound
+        info = self.filesystem.get_file_info(str(path))
+        return info.type == pyarrow.fs.FileType.File
+
+    def _save(self, path: PurePosixPath, array: numpy.ndarray) -> None:
+        with self.filesystem.open_output_stream(str(path)) as stream:
+            numpy.save(stream, array)
+
+    def _load(self, path: PurePosixPath) -> numpy.ndarray:
+        # open_input_file, not open_input_stream: numpy.load needs to seek
+        with self.filesystem.open_input_file(str(path)) as file:
+            return numpy.load(file, allow_pickle=False)
 
 
 def load_tokenizer(name: str) -> PreTrainedTokenizerFast:
@@ -38,7 +112,6 @@ def load_development_ids(repository_id: str, expected_size: int) -> frozenset[st
         table = pyarrow.parquet.read_table(path, columns=["id"])
         document_ids.update(table.column("id").to_pylist())
 
-    # An empty or partial set would silently leak eval documents into training
     if len(document_ids) != expected_size:
         raise ValueError(
             f"expected {expected_size} development ids, got {len(document_ids)}"
@@ -52,9 +125,6 @@ def open_dataset(uri: str) -> LanceDataset:
 
 
 def shuffled_fragment_ids(dataset: LanceDataset, seed: int) -> list[int]:
-    """
-    Return the dataset's fragment ids in a random order, fixed by seed.
-    """
     # Shuffle the real ids: Lance doesn't guarantee they are contiguous 0..N-1.
     # Sort first so the result depends only on the seed, not on listing order
     fragment_ids = sorted(fragment.fragment_id for fragment in dataset.get_fragments())
@@ -68,7 +138,7 @@ class FragmentTokenizer:
         dataset: LanceDataset,
         tokenizer: PreTrainedTokenizerFast,
         exclude_ids: frozenset[str],
-        output_root: Path,
+        store: ShardStore,
         batch_size: int = 1024,
     ) -> None:
         if batch_size <= 0:
@@ -77,22 +147,43 @@ class FragmentTokenizer:
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.exclude_ids = exclude_ids
-        self.output_root = output_root
+        self.store = store
         self.batch_size = batch_size
 
     def tokenize_fragment(self, fragment_id: int) -> int:
-        output_dir = self.output_root / f"{fragment_id:06d}"
+        name = f"{fragment_id:06d}"
 
-        if output_dir.exists():
-            return int(numpy.load(output_dir / "offsets.npy")[-1])
+        if self.store.has_shard(name):
+            return int(self.store.read_offsets(name)[-1])
 
         documents: list[TokenArray] = []
 
         for texts in self._iter_texts(fragment_id):
             documents.extend(self._encode(texts))
 
-        self._write_shard(output_dir, documents)
+        tokens, offsets = self._concatenate(documents)
+
+        self.store.write_shard(name, tokens, offsets)
         return sum(document.size for document in documents)
+
+    @staticmethod
+    def _concatenate(documents: list[TokenArray]) -> tuple[TokenArray, Offsets]:
+        lengths = numpy.fromiter(
+            (document.size for document in documents),
+            dtype=numpy.int64,
+            count=len(documents),
+        )
+
+        offsets = numpy.zeros(len(documents) + 1, dtype=numpy.int64)
+
+        numpy.cumsum(lengths, out=offsets[1:])
+
+        if documents:
+            tokens = numpy.concatenate(documents)
+        else:
+            tokens = numpy.empty(0, dtype=numpy.int32)
+
+        return tokens, offsets
 
     def _iter_texts(self, fragment_id: int) -> Iterator[list[str]]:
         fragment = self.dataset.get_fragment(fragment_id)
@@ -125,29 +216,3 @@ class FragmentTokenizer:
             numpy.array([bos_token_id, *token_ids, eos_token_id], dtype=numpy.int32)
             for token_ids in encoded["input_ids"]
         ]
-
-    @staticmethod
-    def _write_shard(output_dir: Path, documents: list[TokenArray]) -> None:
-        lengths = numpy.fromiter(
-            (document.size for document in documents),
-            dtype=numpy.int64,
-            count=len(documents)
-        )
-
-        offsets = numpy.zeros(len(documents) + 1, dtype=numpy.int64)
-
-        numpy.cumsum(lengths, out=offsets[1:])
-
-        if documents:
-            tokens = numpy.concatenate(documents)
-        else:
-            tokens = numpy.empty(0, dtype=numpy.int32)
-
-        temporary_dir = output_dir.with_name(output_dir.name + ".tmp")
-        temporary_dir.mkdir(parents=True, exist_ok=True)
-
-        numpy.save(temporary_dir / "tokens.npy", tokens)
-        numpy.save(temporary_dir / "offsets.npy", offsets)
-
-        # Since rename is atomic, output_dir exists = shard is complete
-        temporary_dir.rename(output_dir)
