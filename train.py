@@ -1,14 +1,3 @@
-"""
-Train a Llama 3.2-style model on pre-tokenized shards (see prepare.py).
-
-Baseline recipe: HF's stock LlamaForCausalLM, Muon (hidden matrices) + AdamW (embedding
-and norms) with one shared LR, warmup-stable-decay schedule.
-
-    eval "$(flock s3 credentials --ttl 24h)"
-    uv run train.py --data s3://<bucket>/fineweb-edu-llama3 --model-size 150M \\
-        --total-tokens 30000000000 --run-name baseline-150M
-"""
-
 import argparse
 import dataclasses
 import math
