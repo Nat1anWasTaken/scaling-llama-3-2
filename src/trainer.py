@@ -1,7 +1,10 @@
+import contextlib
+import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Protocol
 
+import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -73,6 +76,16 @@ class Logger(Protocol):
         raise NotImplementedError
 
 
+def autocast(device: torch.device) -> contextlib.AbstractContextManager[object]:
+    """
+    bf16 autocast on CUDA, plain fp32 elsewhere (CPU/MPS debug runs)
+    """
+    if device.type == "cuda":
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+
+    return contextlib.nullcontext()
+
+
 class Trainer:
     def __init__(
         self,
@@ -105,6 +118,8 @@ class Trainer:
 
         log_loss_sum = 0
         log_loss_token = 0
+        log_input_tokens = 0
+        log_start_time = time.monotonic()
 
         while self.state.tokens_seen < self.cfg.total_tokens:
             self.optimizer.zero_grad()
@@ -128,9 +143,10 @@ class Trainer:
                 labels = batch["labels"].to(device)
                 position_ids = batch["position_ids"].to(device)
 
-                output = self.model(
-                    input_ids=input_ids, position_ids=position_ids, use_cache=False
-                )
+                with autocast(device):
+                    output = self.model(
+                        input_ids=input_ids, position_ids=position_ids, use_cache=False
+                    )
                 logits = output.logits
                 loss_sum, num_loss_tokens = self.loss_fn(logits, labels)
                 loss_sum.backward()
@@ -158,23 +174,43 @@ class Trainer:
             self.state.step += 1
             self.state.tokens_seen += update_input_tokens
             log_loss_token += update_loss_tokens
+            log_input_tokens += update_input_tokens
+            is_last_step = self.state.tokens_seen >= self.cfg.total_tokens
 
             # Log metrics
             # Note that we only log metrics at the end of each log_every_steps interval or when we reach total_tokens
-            if (
-                self.state.step % self.cfg.log_every_steps == 0
-                or self.state.tokens_seen >= self.cfg.total_tokens
-            ):
-                self.logger.log(
-                    {
-                        "train/loss": log_loss_sum / log_loss_token,
-                        "train/grad_norm": grad_norm,
-                        "train/step": self.state.step,
-                    },
-                    step=self.state.step,
-                )
+            if self.state.step % self.cfg.log_every_steps == 0 or is_last_step:
+                elapsed = time.monotonic() - log_start_time
+                metrics = {
+                    "train/loss": log_loss_sum / log_loss_token,
+                    "train/grad_norm": grad_norm,
+                    "train/step": self.state.step,
+                    "train/tokens_per_second": log_input_tokens / elapsed,
+                    "train/total_tokens_seen": self.state.tokens_seen,
+                }
+                # One learning rate per param group, named when the group has a name
+                for index, group in enumerate(self.optimizer.param_groups):
+                    name = group.get("name", str(index))
+                    metrics[f"train/learning_rate/{name}"] = group["lr"]
+
+                self.logger.log(metrics, step=self.state.step)
                 log_loss_sum = 0
                 log_loss_token = 0
+                log_input_tokens = 0
+                log_start_time = time.monotonic()
+
+            if self.state.step % self.cfg.eval_every_steps == 0 or is_last_step:
+                result = self.evaluator(self.model)
+                self.logger.log(
+                    {"eval/loss": result.loss, "eval/perplexity": result.perplexity},
+                    step=self.state.step,
+                )
+                # Don't count eval time as training throughput
+                log_start_time = time.monotonic()
+
+            if self.state.step % self.cfg.ckpt_every_steps == 0 or is_last_step:
+                self.ckpt.save(self.state, self.model)
+                log_start_time = time.monotonic()
 
     def _get_batch_samples(
         self,
@@ -194,7 +230,7 @@ class Trainer:
                 break
             batch_size = batch["input_ids"].shape[0]
             n_sequences = min(batch_size, remaining_tokens // self.cfg.seq_len)
-            
+
             if n_sequences < batch_size:
                 trimmed_batch: Batch = {
                     "input_ids": batch["input_ids"][:n_sequences],
