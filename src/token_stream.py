@@ -1,9 +1,10 @@
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy
 
 from .data import TokenArray
-from .tokenizer import ShardStore
+from .tokenizer import Offsets, ShardStore
 
 
 class TokenStream:
@@ -25,11 +26,22 @@ class TokenStream:
     def __iter__(self) -> Iterator[TokenArray]:
         random_generator = numpy.random.default_rng(self.seed)
 
-        for name in self.shard_names:
-            # A whole shard (~200MB) is read into memory at once. Over S3 this stalls
-            # training for a few seconds per shard; prefetching would hide that
-            tokens = self.store.read_tokens(name)
-            offsets = self.store.read_offsets(name)
+        # A whole shard (~200MB) is read into memory at once, which over S3 takes a few
+        # seconds. Read the next shard on a background thread while this one is consumed;
+        # pyarrow releases the GIL during I/O, so the read really overlaps training
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self._read_shard, self.shard_names[0])
 
-            for index in random_generator.permutation(offsets.size - 1):
-                yield tokens[offsets[index] : offsets[index + 1]]
+            for index in range(len(self.shard_names)):
+                tokens, offsets = pending.result()
+
+                if index + 1 < len(self.shard_names):
+                    pending = pool.submit(self._read_shard, self.shard_names[index + 1])
+
+                # The permutations are drawn in the same order as before, so every rank
+                # still sees the same document sequence
+                for document in random_generator.permutation(offsets.size - 1):
+                    yield tokens[offsets[document] : offsets[document + 1]]
+
+    def _read_shard(self, name: str) -> tuple[TokenArray, Offsets]:
+        return self.store.read_tokens(name), self.store.read_offsets(name)
