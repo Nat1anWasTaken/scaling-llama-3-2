@@ -9,7 +9,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerFast
 
 from .data import Batch, PackedDataLoader, SequencePacker, TokenArray
 from .loss import CausalLMLossSum
-from .trainer import EvaluationResult, autocast
+from .trainer import EvaluationResult, forward_batch, uses_varlen_attention
 
 
 def load_development_texts(repository_id: str) -> list[str]:
@@ -76,21 +76,15 @@ class DevelopmentEvaluator:
         was_training = model.training
         model.eval()
         device = model.device
+        varlen = uses_varlen_attention(model)
 
         loss_sum = 0.0
         num_tokens = 0
 
         for batch in self.batches:
-            with autocast(device):
-                output = model(
-                    input_ids=batch["input_ids"].to(device),
-                    position_ids=batch["position_ids"].to(device),
-                    use_cache=False,
-                )
-
-            batch_loss_sum, batch_num_tokens = self.loss_fn(
-                output.logits, batch["labels"].to(device)
-            )
+            logits, labels = forward_batch(model, batch, device, varlen)
+            batch_loss_sum, batch_num_tokens = self.loss_fn(logits, labels)
+            del logits
             loss_sum += batch_loss_sum.item()
             num_tokens += int(batch_num_tokens.item())
 

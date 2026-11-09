@@ -118,6 +118,10 @@ def parse_arguments() -> argparse.Namespace:
         default=True,
         help="torch.compile the model, on by default (--no-compile turns it off)",
     )
+    parser.add_argument(
+        "--attn-implementation",
+        help="default: flash_attention_3 on CUDA, else sdpa",
+    )
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
 
     return parser.parse_args()
@@ -204,6 +208,12 @@ def main() -> None:
     )
     model = LlamaForCausalLM(model_config).to(device)
 
+    # FA3 needs Hopper-class CUDA GPUs, so CPU and MPS debug runs fall back to SDPA
+    attn_implementation = arguments.attn_implementation or (
+        "flash_attention_3" if device.type == "cuda" else "sdpa"
+    )
+    model.set_attn_implementation(attn_implementation)
+
     num_parameters = sum(parameter.numel() for parameter in model.parameters())
     if rank == 0:
         print(
@@ -265,6 +275,7 @@ def main() -> None:
         "initialization": f"HF default, normal(0, {model_config.initializer_range})",
         "optimizer": "Muon(match_rms_adamw) for decoder 2D weights, AdamW otherwise",
         "schedule": "linear warmup, constant, linear decay to 0 (WSD)",
+        "attention": attn_implementation,
     }
 
     if arguments.no_wandb or rank != 0:

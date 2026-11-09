@@ -87,6 +87,57 @@ def autocast(device: torch.device) -> contextlib.AbstractContextManager[object]:
     return contextlib.nullcontext()
 
 
+def uses_varlen_attention(model: PreTrainedModel) -> bool:
+    """
+    FlashAttention takes packed documents as one flat sequence plus their boundaries
+    """
+    return str(model.config._attn_implementation).startswith("flash_attention")
+
+
+def forward_batch(
+    model: torch.nn.Module, batch: Batch, device: torch.device, varlen: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Run the model on one packed batch, returning the logits and the labels they line up with
+    """
+    input_ids = batch["input_ids"]
+    labels = batch["labels"]
+    position_ids = batch["position_ids"]
+    varlen_kwargs: dict[str, torch.Tensor | int] = {}
+
+    if varlen:
+        # HF only infers document boundaries from position_ids when the batch size is 1,
+        # and pays a GPU sync in every layer to do it. So flatten [B, T] into [1, B*T]
+        # and hand FlashAttention the boundaries directly, computed here on the CPU.
+        # Every row starts at position 0, so row edges count as document edges too
+        seq_len = input_ids.shape[1]
+        input_ids, labels, position_ids = (
+            tensor.reshape(1, -1) for tensor in (input_ids, labels, position_ids)
+        )
+        starts = (position_ids[0] == 0).nonzero().flatten()
+        cu_seq_lens = torch.cat([starts, torch.tensor([position_ids.numel()])]).to(
+            device=device, dtype=torch.int32, non_blocking=True
+        )
+        varlen_kwargs = {
+            "cu_seq_lens_q": cu_seq_lens,
+            "cu_seq_lens_k": cu_seq_lens,
+            # An upper bound is enough, and a constant avoids a recompile for every batch
+            "max_length_q": seq_len,
+            "max_length_k": seq_len,
+        }
+
+    # non_blocking: a blocking host-to-device copy first waits for every queued kernel
+    with autocast(device):
+        output = model(
+            input_ids=input_ids.to(device, non_blocking=True),
+            position_ids=position_ids.to(device, non_blocking=True),
+            use_cache=False,
+            **varlen_kwargs,
+        )
+
+    return output.logits, labels.to(device, non_blocking=True)
+
+
 def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
     """
     In-place sum across ranks, unchanged on a single process
@@ -123,6 +174,7 @@ class Trainer:
             else model
         )
         self.device = self.raw_model.device
+        self.varlen = uses_varlen_attention(self.raw_model)
         self.rank = (
             torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         )
@@ -171,10 +223,6 @@ class Trainer:
 
             # Compute loss and gradients for each batch
             for index, batch in enumerate(batches):
-                input_ids = batch["input_ids"].to(device)
-                labels = batch["labels"].to(device)
-                position_ids = batch["position_ids"].to(device)
-
                 is_last_micro_batch = index == len(batches) - 1
 
                 sync_context = (
@@ -185,22 +233,18 @@ class Trainer:
                 )
 
                 with sync_context:
-                    with autocast(device):
-                        output = self.model(
-                            input_ids=input_ids,
-                            position_ids=position_ids,
-                            use_cache=False,
-                        )
-                    logits = output.logits
+                    logits, labels = forward_batch(
+                        self.model, batch, device, self.varlen
+                    )
                     loss_sum, num_loss_tokens = self.loss_fn(logits, labels)
                     loss_sum.backward()
 
                 # Free the logits now, a for loop keeps them alive until the next forward returns
-                del output, logits
+                del logits
 
                 step_stats[0] += loss_sum.detach()
                 step_stats[1] += num_loss_tokens
-                step_stats[2] += input_ids.numel()
+                step_stats[2] += batch["input_ids"].numel()
 
             # One all-reduce for all three numbers, so log_stats is already global
             all_reduce_sum(step_stats)
