@@ -78,7 +78,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--total-tokens", type=int, required=True)
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--micro-batch-size", type=int, default=8)
-    parser.add_argument("--grad-accum-steps", type=int, default=16)
+    # Replaces --grad-accum-steps: the global batch is part of the recipe, while the
+    # micro batch and GPU count only decide how it is computed
+    parser.add_argument(
+        "--global-batch-tokens",
+        type=int,
+        default=4096 * 8 * 16 * 8,
+        help="tokens per optimizer step summed over all ranks (default: 4,194,304)",
+    )
 
     parser.add_argument("--learning-rate", type=float, default=3e-3)
     parser.add_argument("--weight-decay", type=float, default=0.1)
@@ -146,12 +153,16 @@ def main() -> None:
     torch.manual_seed(arguments.seed)
 
     rank, world_size, device = setup_distributed(arguments.device)
-    tokens_per_step = (
-        arguments.seq_len
-        * arguments.micro_batch_size
-        * arguments.grad_accum_steps
-        * world_size
-    )
+
+    tokens_per_micro_step = arguments.seq_len * arguments.micro_batch_size * world_size
+    if arguments.global_batch_tokens % tokens_per_micro_step != 0:
+        raise ValueError(
+            f"global_batch_tokens ({arguments.global_batch_tokens}) must be divisible by "
+            f"seq_len * micro_batch_size * world_size ({tokens_per_micro_step})"
+        )
+
+    grad_accum_steps = arguments.global_batch_tokens // tokens_per_micro_step
+    tokens_per_step = arguments.global_batch_tokens
 
     if arguments.total_tokens % tokens_per_step != 0:
         raise ValueError(
@@ -165,7 +176,7 @@ def main() -> None:
         total_tokens=arguments.total_tokens,
         seq_len=arguments.seq_len,
         micro_batch_size=arguments.micro_batch_size,
-        grad_accum_steps=arguments.grad_accum_steps,
+        grad_accum_steps=grad_accum_steps,
         max_grad_norm=arguments.max_grad_norm,
         log_every_steps=arguments.log_every_steps,
         eval_every_steps=arguments.eval_every_steps or max(1, total_steps // 10),
@@ -240,6 +251,8 @@ def main() -> None:
         "model": model_config.to_dict(),
         "num_parameters": num_parameters,
         "tokens_per_step": tokens_per_step,
+        "world_size": world_size,
+        "grad_accum_steps": grad_accum_steps,
         "total_steps": total_steps,
         "training": dataclasses.asdict(training_config),
         "initialization": f"HF default, normal(0, {model_config.initializer_range})",
