@@ -2,9 +2,10 @@ import contextlib
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -86,21 +87,53 @@ def autocast(device: torch.device) -> contextlib.AbstractContextManager[object]:
     return contextlib.nullcontext()
 
 
+def all_reduce_sum(values: list[float], device: torch.device) -> list[float]:
+    """
+    All-reduce sum of a list of floats across all ranks, unchanged on a single process.
+    """
+    if not torch.distributed.is_initialized():
+        return values
+
+    # float64: token counts reach 1e10, past where float32 holds integers exactly
+    tensor = torch.tensor(values, dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+    return tensor.tolist()
+
+
+def barrier() -> None:
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
 class Trainer:
     def __init__(
         self,
-        model: PreTrainedModel,
+        model: PreTrainedModel | DistributedDataParallel,
         train_data: Iterable[Batch],
         loss_fn: CausalLMLossSum,
         optimizer: Optimizer,
         scheduler: LRScheduler,
-        evaluator: Evaluator,
+        evaluator: Evaluator | None,
         ckpt: Checkpointer,
         logger: Logger,
         cfg: TrainingConfig,
     ) -> None:
         # Note we do not perform any validation here, since we already do it in the config
         self.model = model
+        self.raw_model = (
+            cast(PreTrainedModel, model.module)
+            if isinstance(model, DistributedDataParallel)
+            else model
+        )
+        self.device = self.raw_model.device
+        self.rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
+        self.world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
         self.train_data = train_data
         self.loss_fn = loss_fn
         self.optimizer = optimizer
@@ -114,22 +147,24 @@ class Trainer:
     def train(self) -> None:
         self.model.train()
         train_iter = iter(self.train_data)
-        device = self.model.device
+        device = self.device
 
-        log_loss_sum = 0
-        log_loss_token = 0
-        log_input_tokens = 0
+        log_loss_sum = 0.0
+        log_loss_token = 0.0
+        log_input_tokens = 0.0
         log_start_time = time.monotonic()
 
         while self.state.tokens_seen < self.cfg.total_tokens:
             self.optimizer.zero_grad()
 
             # Get remaining tokens and batch samples
+            # tokens_seen counts all ranks, each rank only covers 1/world_size of it
             remaining_tokens = self.cfg.total_tokens - self.state.tokens_seen
-            batches = self._get_batch_samples(train_iter, remaining_tokens)
+            local_remaining_tokens = remaining_tokens // self.world_size
+            batches = self._get_batch_samples(train_iter, local_remaining_tokens)
             if not batches:
                 train_iter = iter(self.train_data)
-                batches = self._get_batch_samples(train_iter, remaining_tokens)
+                batches = self._get_batch_samples(train_iter, local_remaining_tokens)
                 if not batches:
                     raise ValueError("No batches found even after resetting train_iter")
 
@@ -138,78 +173,114 @@ class Trainer:
             update_input_tokens = 0
 
             # Compute loss and gradients for each batch
-            for batch in batches:
+            for index, batch in enumerate(batches):
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
                 position_ids = batch["position_ids"].to(device)
 
-                with autocast(device):
-                    output = self.model(
-                        input_ids=input_ids, position_ids=position_ids, use_cache=False
-                    )
-                logits = output.logits
-                loss_sum, num_loss_tokens = self.loss_fn(logits, labels)
-                loss_sum.backward()
+                is_last_micro_batch = index == len(batches) - 1
+
+                sync_context = (
+                    self.model.no_sync()
+                    if isinstance(self.model, DistributedDataParallel)
+                    and not is_last_micro_batch
+                    else contextlib.nullcontext()
+                )
+
+                with sync_context:
+                    with autocast(device):
+                        output = self.model(
+                            input_ids=input_ids,
+                            position_ids=position_ids,
+                            use_cache=False,
+                        )
+                    logits = output.logits
+                    loss_sum, num_loss_tokens = self.loss_fn(logits, labels)
+                    loss_sum.backward()
+
+                # Free the logits now, a for loop keeps them alive until the next forward returns
+                del output, logits
 
                 log_loss_sum += loss_sum.detach().item()
                 update_loss_tokens += num_loss_tokens.item()
                 update_input_tokens += input_ids.numel()
 
-            # Normalize gradients and update model
-            for param in self.model.parameters():
+            # Normalize gradients by the loss tokens of all ranks
+            # DDP already averaged them to sum_r(grad_r) / world_size, so multiply by
+            # world_size / global_loss_tokens to get sum_r(grad_r) / global_loss_tokens
+            global_loss_tokens, global_input_tokens = all_reduce_sum(
+                [update_loss_tokens, update_input_tokens], device
+            )
+            scale = self.world_size / global_loss_tokens
+            for param in self.raw_model.parameters():
                 if param.grad is not None:
-                    param.grad.div_(update_loss_tokens)
+                    param.grad.mul_(scale)
 
             # Clip gradients and update model
+            # Every rank holds the same gradients after the all-reduce, so the norm matches too
             max_norm = float("inf")
             if self.cfg.max_grad_norm is not None:
                 max_norm = self.cfg.max_grad_norm
             grad_norm: float = clip_grad_norm_(
-                self.model.parameters(), max_norm=max_norm
+                self.raw_model.parameters(), max_norm=max_norm
             ).item()
 
             # Next step
             self.optimizer.step()
             self.scheduler.step()
             self.state.step += 1
-            self.state.tokens_seen += update_input_tokens
-            log_loss_token += update_loss_tokens
-            log_input_tokens += update_input_tokens
+            self.state.tokens_seen += int(global_input_tokens)
+            log_loss_token += global_loss_tokens
+            log_input_tokens += global_input_tokens
             is_last_step = self.state.tokens_seen >= self.cfg.total_tokens
 
             # Log metrics
             # Note that we only log metrics at the end of each log_every_steps interval or when we reach total_tokens
             if self.state.step % self.cfg.log_every_steps == 0 or is_last_step:
-                elapsed = time.monotonic() - log_start_time
-                metrics = {
-                    "train/loss": log_loss_sum / log_loss_token,
-                    "train/grad_norm": grad_norm,
-                    "train/step": self.state.step,
-                    "train/tokens_per_second": log_input_tokens / elapsed,
-                    "train/total_tokens_seen": self.state.tokens_seen,
-                }
-                # One learning rate per param group, named when the group has a name
-                for index, group in enumerate(self.optimizer.param_groups):
-                    name = group.get("name", str(index))
-                    metrics[f"train/learning_rate/{name}"] = group["lr"]
+                # Every rank has to join the all-reduce, so it stays outside the rank 0 check
+                (global_log_loss_sum,) = all_reduce_sum([log_loss_sum], device)
 
-                self.logger.log(metrics, step=self.state.step)
-                log_loss_sum = 0
-                log_loss_token = 0
-                log_input_tokens = 0
+                if self.rank == 0:
+                    elapsed = time.monotonic() - log_start_time
+                    metrics = {
+                        "train/loss": global_log_loss_sum / log_loss_token,
+                        "train/grad_norm": grad_norm,
+                        "train/step": self.state.step,
+                        "train/tokens_per_second": log_input_tokens / elapsed,
+                        "train/total_tokens_seen": self.state.tokens_seen,
+                    }
+                    # One learning rate per param group, named when the group has a name
+                    for index, group in enumerate(self.optimizer.param_groups):
+                        name = group.get("name", str(index))
+                        metrics[f"train/learning_rate/{name}"] = group["lr"]
+
+                    self.logger.log(metrics, step=self.state.step)
+
+                log_loss_sum = 0.0
+                log_loss_token = 0.0
+                log_input_tokens = 0.0
                 log_start_time = time.monotonic()
 
+            # Eval and checkpoint run on rank 0 with the unwrapped model, the other ranks
+            # wait at the barrier. The DDP wrapper would block in its buffer broadcast
             if self.state.step % self.cfg.eval_every_steps == 0 or is_last_step:
-                result = self.evaluator(self.model)
-                self.logger.log(
-                    {"eval/loss": result.loss, "eval/perplexity": result.perplexity},
-                    step=self.state.step,
-                )
+                if self.rank == 0 and self.evaluator is not None:
+                    result = self.evaluator(self.raw_model)
+                    self.logger.log(
+                        {
+                            "eval/loss": result.loss,
+                            "eval/perplexity": result.perplexity,
+                        },
+                        step=self.state.step,
+                    )
+                barrier()
                 # Don't count eval time as training throughput
                 log_start_time = time.monotonic()
 
             if self.state.step % self.cfg.ckpt_every_steps == 0 or is_last_step:
-                self.ckpt.save(self.state, self.model)
+                if self.rank == 0:
+                    self.ckpt.save(self.state, self.raw_model)
+                barrier()
                 log_start_time = time.monotonic()
 
     def _get_batch_samples(
