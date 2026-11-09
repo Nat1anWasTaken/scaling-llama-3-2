@@ -2,7 +2,8 @@
 Pre-tokenize FineWeb-Edu into shards, in a fixed shuffled fragment order, until a token budget.
 
     eval "$(flock s3 credentials --ttl 24h)"
-    uv run prepare.py --output s3://<bucket>/fineweb-edu-llama3 --token-budget 30000000000
+    uv run prepare.py --output s3://<bucket>/fineweb-edu-llama3 --token-budget 30000000000 \\
+        --run-name prepare-fineweb-edu-llama3
 
 Rerunning with the same --output skips finished shards, so an interrupted run (or an
 expired S3 key) only needs a rerun, and a larger budget only tokenizes the extra fragments.
@@ -13,6 +14,7 @@ import multiprocessing
 import os
 import time
 
+from src.loggers import ConsoleLogger, WandbLogger
 from src.tokenizer import (
     FragmentTokenizer,
     ShardStore,
@@ -27,6 +29,7 @@ DATASET_URI = "s3://flock-datasets/fineweb-edu"
 DEVELOPMENT_DATASET = "cerulean-works/fineweb-edu-dev"
 DEVELOPMENT_SIZE = 5000
 SHARD_FORMAT = "[BOS, text, EOS] int32 tokens.npy + int64 offsets.npy"
+WANDB_PROJECT = "lab6-predictable-scaling"
 
 # One per worker process, built by initialize_worker
 worker: FragmentTokenizer | None = None
@@ -89,6 +92,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--tokenizer", default=TOKENIZER_NAME)
     parser.add_argument("--dataset", default=DATASET_URI)
     parser.add_argument("--development-dataset", default=DEVELOPMENT_DATASET)
+    parser.add_argument("--run-name", required=True, help="names the wandb run")
+    parser.add_argument("--no-wandb", action="store_true", help="log to console only")
     return parser.parse_args()
 
 
@@ -97,16 +102,21 @@ def main() -> None:
     store = ShardStore(arguments.output)
     dataset = open_dataset(arguments.dataset)
 
-    check_metadata(
-        store,
-        {
-            "tokenizer": arguments.tokenizer,
-            "dataset": arguments.dataset,
-            "dataset_version": dataset.version,
-            "development_dataset": arguments.development_dataset,
-            "format": SHARD_FORMAT,
-        },
-    )
+    metadata = {
+        "tokenizer": arguments.tokenizer,
+        "dataset": arguments.dataset,
+        "dataset_version": dataset.version,
+        "development_dataset": arguments.development_dataset,
+        "format": SHARD_FORMAT,
+    }
+    check_metadata(store, metadata)
+
+    if arguments.no_wandb:
+        logger: ConsoleLogger | WandbLogger = ConsoleLogger()
+    else:
+        logger = WandbLogger(
+            WANDB_PROJECT, arguments.run_name, {**vars(arguments), **metadata}
+        )
 
     # Download into the HF cache once here, so workers don't all race to download it,
     load_tokenizer(arguments.tokenizer)
@@ -140,11 +150,15 @@ def main() -> None:
             total_tokens += tokens
 
             elapsed = time.monotonic() - start_time
-            print(
-                f"[{len(shards)}] fragment {fragment_id:06d}: {tokens / 1e6:.1f}M tokens, "
-                f"total {total_tokens / 1e9:.2f}B / {arguments.token_budget / 1e9:.2f}B "
-                f"({total_tokens / elapsed / 1e6:.2f}M tokens/s)",
-                flush=True,
+            logger.log(
+                {
+                    "prepare/fragment_id": fragment_id,
+                    "prepare/shard_tokens": tokens,
+                    "prepare/total_tokens": total_tokens,
+                    "prepare/budget_fraction": total_tokens / arguments.token_budget,
+                    "prepare/tokens_per_second": total_tokens / elapsed,
+                },
+                step=len(shards),
             )
 
             if total_tokens >= arguments.token_budget:
@@ -165,6 +179,12 @@ def main() -> None:
             "shards": shards,
         },
     )
+
+    if isinstance(logger, WandbLogger):
+        logger.run.summary["total_tokens"] = total_tokens
+        logger.run.summary["num_shards"] = len(shards)
+        logger.run.summary["ran_out"] = total_tokens < arguments.token_budget
+        logger.finish()
 
 
 # Required with spawn: each worker re-imports this file, and must not rerun main()
