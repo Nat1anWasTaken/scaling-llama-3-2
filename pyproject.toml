@@ -5,10 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "kernels>=0.17.2,<0.18.0 ; sys_platform == 'linux'",
     "pyarrow>=26.0.1",
     "pylance>=14.0.2",
     "torch>=2.15.0",
     "transformers>=5.22.1",
+    "wandb>=0.31.0",
 ]
 
 [[tool.uv.index]]
@@ -17,7 +19,8 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cpu" }]
+# CPU wheels on macOS only. Linux falls through to PyPI, whose torch wheels ship CUDA
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'darwin'" }]
 
 [dependency-groups]
 dev = [
