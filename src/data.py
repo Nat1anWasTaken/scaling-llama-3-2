@@ -1,4 +1,5 @@
 # TODO: The DataLoader, produces the Iterable[Batch] that Trainer takes
+import itertools
 from collections import deque
 from collections.abc import Iterable, Iterator
 from typing import TypedDict
@@ -18,6 +19,15 @@ class Batch(TypedDict):
     input_ids: Tensor
     labels: Tensor
     position_ids: Tensor
+
+class RankShardedRow:
+    def __init__(self, rows: Iterable[PackedRow], rank: int, world_size: int) -> None:
+        self.rows = rows
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self) -> Iterator[PackedRow]:
+        return itertools.islice((self.rows), self.rank, None, self.world_size)
 
 
 class SequencePacker:
