@@ -87,17 +87,14 @@ def autocast(device: torch.device) -> contextlib.AbstractContextManager[object]:
     return contextlib.nullcontext()
 
 
-def all_reduce_sum(values: list[float], device: torch.device) -> list[float]:
+def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
     """
-    All-reduce sum of a list of floats across all ranks, unchanged on a single process.
+    In-place sum across ranks, unchanged on a single process
     """
-    if not torch.distributed.is_initialized():
-        return values
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
 
-    # float64: token counts reach 1e10, past where float32 holds integers exactly
-    tensor = torch.tensor(values, dtype=torch.float64, device=device)
-    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
-    return tensor.tolist()
+    return tensor
 
 
 def barrier() -> None:
@@ -149,9 +146,9 @@ class Trainer:
         train_iter = iter(self.train_data)
         device = self.device
 
-        log_loss_sum = 0.0
-        log_loss_token = 0.0
-        log_input_tokens = 0.0
+        # [loss_sum, loss_tokens, input_tokens] summed over all ranks since the last log.
+        # float64: token counts reach 1e10, past where float32 holds integers exactly
+        log_stats = torch.zeros(3, dtype=torch.float64, device=device)
         log_start_time = time.monotonic()
 
         while self.state.tokens_seen < self.cfg.total_tokens:
@@ -168,9 +165,9 @@ class Trainer:
                 if not batches:
                     raise ValueError("No batches found even after resetting train_iter")
 
-            # Create log metrics
-            update_loss_tokens = 0
-            update_input_tokens = 0
+            # Same layout as log_stats, for this step only. Kept on the GPU so the
+            # micro-batch loop never waits for the GPU to catch up
+            step_stats = torch.zeros(3, dtype=torch.float64, device=device)
 
             # Compute loss and gradients for each batch
             for index, batch in enumerate(batches):
@@ -201,50 +198,49 @@ class Trainer:
                 # Free the logits now, a for loop keeps them alive until the next forward returns
                 del output, logits
 
-                log_loss_sum += loss_sum.detach().item()
-                update_loss_tokens += num_loss_tokens.item()
-                update_input_tokens += input_ids.numel()
+                step_stats[0] += loss_sum.detach()
+                step_stats[1] += num_loss_tokens
+                step_stats[2] += input_ids.numel()
+
+            # One all-reduce for all three numbers, so log_stats is already global
+            all_reduce_sum(step_stats)
+            global_loss_tokens = step_stats[1]
 
             # Normalize gradients by the loss tokens of all ranks
             # DDP already averaged them to sum_r(grad_r) / world_size, so multiply by
-            # world_size / global_loss_tokens to get sum_r(grad_r) / global_loss_tokens
-            global_loss_tokens, global_input_tokens = all_reduce_sum(
-                [update_loss_tokens, update_input_tokens], device
-            )
+            # world_size / global_loss_tokens to get sum_r(grad_r) / global_loss_tokens.
+            # scale is a 0-dim GPU tensor, so this doesn't need the value on the CPU
             scale = self.world_size / global_loss_tokens
             for param in self.raw_model.parameters():
                 if param.grad is not None:
                     param.grad.mul_(scale)
 
             # Clip gradients and update model
-            # Every rank holds the same gradients after the all-reduce, so the norm matches too
+            # Every rank holds the same gradients after the all-reduce, so the norm matches too.
+            # The norm stays a tensor and is only read back when logging
             max_norm = float("inf")
             if self.cfg.max_grad_norm is not None:
                 max_norm = self.cfg.max_grad_norm
-            grad_norm: float = clip_grad_norm_(
-                self.raw_model.parameters(), max_norm=max_norm
-            ).item()
+            grad_norm = clip_grad_norm_(self.raw_model.parameters(), max_norm=max_norm)
 
             # Next step
             self.optimizer.step()
             self.scheduler.step()
+            log_stats += step_stats
             self.state.step += 1
-            self.state.tokens_seen += int(global_input_tokens)
-            log_loss_token += global_loss_tokens
-            log_input_tokens += global_input_tokens
+            # The step's only GPU sync: the while condition needs tokens_seen on the CPU
+            self.state.tokens_seen += int(step_stats[2].item())
             is_last_step = self.state.tokens_seen >= self.cfg.total_tokens
 
             # Log metrics
             # Note that we only log metrics at the end of each log_every_steps interval or when we reach total_tokens
             if self.state.step % self.cfg.log_every_steps == 0 or is_last_step:
-                # Every rank has to join the all-reduce, so it stays outside the rank 0 check
-                (global_log_loss_sum,) = all_reduce_sum([log_loss_sum], device)
-
                 if self.rank == 0:
+                    log_loss_sum, log_loss_tokens, log_input_tokens = log_stats.tolist()
                     elapsed = time.monotonic() - log_start_time
                     metrics = {
-                        "train/loss": global_log_loss_sum / log_loss_token,
-                        "train/grad_norm": grad_norm,
+                        "train/loss": log_loss_sum / log_loss_tokens,
+                        "train/grad_norm": grad_norm.item(),
                         "train/step": self.state.step,
                         "train/tokens_per_second": log_input_tokens / elapsed,
                         "train/total_tokens_seen": self.state.tokens_seen,
@@ -256,9 +252,7 @@ class Trainer:
 
                     self.logger.log(metrics, step=self.state.step)
 
-                log_loss_sum = 0.0
-                log_loss_token = 0.0
-                log_input_tokens = 0.0
+                log_stats.zero_()
                 log_start_time = time.monotonic()
 
             # Eval and checkpoint run on rank 0 with the unwrapped model, the other ranks
