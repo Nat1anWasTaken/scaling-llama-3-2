@@ -103,7 +103,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--ckpt-every-steps", type=int, help="default: only at the end")
 
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints"))
-    parser.add_argument("--run-name")
+    parser.add_argument(
+        "--run-name",
+        required=True,
+        help="names the wandb run and the checkpoint directory, so runs never overwrite",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tokenizer", default=TOKENIZER_NAME)
     parser.add_argument("--development-dataset", default=DEVELOPMENT_DATASET)
@@ -265,7 +269,7 @@ def main() -> None:
     else:
         logger = WandbLogger(WANDB_PROJECT, arguments.run_name, run_config)
 
-    run_dir = arguments.output_dir / (arguments.run_name or "unnamed")
+    run_dir = arguments.output_dir / arguments.run_name
     trainer = Trainer(
         model=training_model,
         train_data=train_data,
