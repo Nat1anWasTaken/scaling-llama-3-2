@@ -58,6 +58,31 @@ Always respond to the user in **Traditional Chinese (繁體中文)**.
    limited compute grant (see "Compute Grants" in `LAB.md`), confirm the plan and the grant level
    with the user. Small local or debug runs are fine without asking.
 
+## Run names
+
+`--run-name` names the wandb run and, in `train.py`, the checkpoint directory. Every experiment
+run follows this scheme so runs never overwrite each other and can be traced back to their code:
+
+```
+<experiment>-<scale>-<tokens>[-<variant>]
+```
+
+- `<experiment>`: the experiment branch name without the `exp/` prefix, e.g. `baseline-muon-hf`
+  for `exp/baseline-muon-hf`.
+- `<scale>`: the model size, e.g. `150m`, `750m`, `1b`.
+- `<tokens>`: the training horizon, e.g. `30b`, `150b`.
+- `<variant>`: only when runs share the first three parts, i.e. within a sweep. Name the value
+  that differs, e.g. `lr3e-3`, `wd0.1`, `seed1`.
+
+Examples: `baseline-muon-hf-150m-30b`, `baseline-muon-hf-150m-30b-lr3e-3`.
+
+- Small local or debug runs start with `debug-`, e.g. `debug-baseline-muon-hf-tiny`.
+- Data preparation runs start with `prepare-` and name the `--output`, e.g.
+  `prepare-fineweb-edu-llama3`.
+- Never reuse a run name for a new run. Resuming an interrupted run from its checkpoint keeps
+  its name, since it is the same run (see "Compute Grants" in `LAB.md`).
+- When reporting results, list each run by its run name.
+
 ## Rule for `main`
 
 Code merged into `main` must be **handwritten by the user**. Agent-written experiment code doesn't
