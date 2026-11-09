@@ -1,3 +1,4 @@
+from transformers.utils.generic import is_flash_attention_requested
 import contextlib
 import time
 from collections.abc import Iterable, Iterator
@@ -91,7 +92,7 @@ def uses_varlen_attention(model: PreTrainedModel) -> bool:
     """
     FlashAttention takes packed documents as one flat sequence plus their boundaries
     """
-    return str(model.config._attn_implementation).startswith("flash_attention")
+    return is_flash_attention_requested(model.config)
 
 
 def forward_batch(
