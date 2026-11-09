@@ -1,13 +1,15 @@
 import argparse
 import dataclasses
 import math
+import os
+from collections import namedtuple
 from pathlib import Path
 
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from src.checkpoint import PretrainedCheckpointer
-from src.data import PackedDataLoader, SequencePacker
+from src.data import PackedDataLoader, RankShardedRow, SequencePacker
 from src.evaluation import DevelopmentEvaluator
 from src.loggers import ConsoleLogger, WandbLogger
 from src.loss import CrossEntropyLossSum
@@ -20,6 +22,30 @@ TOKENIZER_NAME = "meta-llama/Llama-3.2-1B"
 DEVELOPMENT_DATASET = "cerulean-works/fineweb-edu-dev"
 WANDB_PROJECT = "lab6-predictable-scaling"
 VOCAB_SIZE = 128256
+
+
+DistributedData = namedtuple("DistributedData", ["rank", "world_size", "device"])
+
+
+def setup_distributed(requested: str | None) -> DistributedData:
+    if "WORLD_SIZE" not in os.environ:
+        return DistributedData(rank=0, world_size=1, device=pick_device(requested))
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+
+    if torch.cuda.is_available() and requested != "cpu":
+        torch.cuda.set_device(local_rank)
+        torch.distributed.init_process_group("nccl")
+        device = torch.device("cuda", local_rank)
+    else:
+        torch.distributed.init_process_group("gloo")
+        device = torch.device("cpu")
+
+    return DistributedData(
+        rank=torch.distributed.get_rank(),
+        world_size=torch.distributed.get_world_size(),
+        device=device,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,11 +144,21 @@ def build_model_config(
 def main() -> None:
     arguments = parse_arguments()
     torch.manual_seed(arguments.seed)
-    device = pick_device(arguments.device)
 
+    rank, world_size, device = setup_distributed(arguments.device)
     tokens_per_step = (
-        arguments.seq_len * arguments.micro_batch_size * arguments.grad_accum_steps
+        arguments.seq_len
+        * arguments.micro_batch_size
+        * arguments.grad_accum_steps
+        * world_size
     )
+
+    if arguments.total_tokens % tokens_per_step != 0:
+        raise ValueError(
+            f"total_tokens ({arguments.total_tokens}) must be divisible by "
+            f"tokens_per_step ({tokens_per_step})"
+        )
+
     total_steps = math.ceil(arguments.total_tokens / tokens_per_step)
 
     training_config = TrainingConfig(
@@ -149,11 +185,12 @@ def main() -> None:
         eos_token_id,
     )
     model = LlamaForCausalLM(model_config).to(device)
-    num_parameters = sum(parameter.numel() for parameter in model.parameters())
-    print(f"model: {arguments.model_size}, {num_parameters:,} parameters on {device}")
 
-    if arguments.compile:
-        model.compile()
+    num_parameters = sum(parameter.numel() for parameter in model.parameters())
+    if rank == 0:
+        print(
+            f"model: {arguments.model_size}, {num_parameters:,} parameters on {device}"
+        )
 
     optimizer = build_muon_adamw(
         model,
@@ -168,19 +205,34 @@ def main() -> None:
         decay_fraction=arguments.decay_fraction,
     )
 
+    training_model = model
+
+    if world_size > 1:
+        device_ids = [device.index] if device.type == "cuda" else None
+        training_model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=device_ids, output_device=device
+        )
+
+    # Compile after wrapping, so dynamo sees DDP and keeps all-reduce overlapped with backward
+    if arguments.compile:
+        training_model.compile()
+
     loss_fn = CrossEntropyLossSum()
-    stream = TokenStream(ShardStore(arguments.data), seed=arguments.seed)
-    train_data = PackedDataLoader(
-        SequencePacker(stream, arguments.seq_len), arguments.micro_batch_size
-    )
-    evaluator = DevelopmentEvaluator(
-        tokenizer,
-        arguments.development_dataset,
-        loss_fn,
-        seq_len=arguments.seq_len,
-        micro_batch_size=arguments.micro_batch_size,
-        max_batches=arguments.eval_max_batches,
-    )
+    stream = TokenStream(store=ShardStore(arguments.data), seed=arguments.seed)
+    rows = RankShardedRow(SequencePacker(stream, arguments.seq_len), rank, world_size)
+    train_data = PackedDataLoader(rows, arguments.micro_batch_size)
+
+    # Only rank 0 evaluates, so only it needs the dev set
+    evaluator: DevelopmentEvaluator | None = None
+    if rank == 0:
+        evaluator = DevelopmentEvaluator(
+            tokenizer,
+            arguments.development_dataset,
+            loss_fn,
+            seq_len=arguments.seq_len,
+            micro_batch_size=arguments.micro_batch_size,
+            max_batches=arguments.eval_max_batches,
+        )
 
     run_config: dict[str, object] = {
         **vars(arguments),
@@ -195,14 +247,14 @@ def main() -> None:
         "schedule": "linear warmup, constant, linear decay to 0 (WSD)",
     }
 
-    if arguments.no_wandb:
+    if arguments.no_wandb or rank != 0:
         logger: ConsoleLogger | WandbLogger = ConsoleLogger()
     else:
         logger = WandbLogger(WANDB_PROJECT, arguments.run_name, run_config)
 
     run_dir = arguments.output_dir / (arguments.run_name or "unnamed")
     trainer = Trainer(
-        model=model,
+        model=training_model,
         train_data=train_data,
         loss_fn=loss_fn,
         optimizer=optimizer,
@@ -213,11 +265,15 @@ def main() -> None:
         cfg=training_config,
     )
 
-    print(f"training {total_steps} steps of {tokens_per_step:,} tokens")
+    if rank == 0:
+        print(f"training {total_steps} steps of {tokens_per_step:,} tokens")
     trainer.train()
 
     if isinstance(logger, WandbLogger):
         logger.finish()
+
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
