@@ -113,7 +113,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--development-dataset", default=DEVELOPMENT_DATASET)
     parser.add_argument("--device", help="default: cuda, else mps, else cpu")
     parser.add_argument(
-        "--compile", action="store_true", help="torch.compile the model"
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="torch.compile the model, on by default (--no-compile turns it off)",
     )
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
 
