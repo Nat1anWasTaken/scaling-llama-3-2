@@ -222,6 +222,10 @@ class Trainer:
             # micro-batch loop never waits for the GPU to catch up
             step_stats = torch.zeros(3, dtype=torch.float64, device=device)
 
+            # Batches live on the CPU, so the input token count needs no GPU sync.
+            # Every rank trims its batches the same way, so all ranks see the same count
+            local_input_tokens = sum(batch["input_ids"].numel() for batch in batches)
+
             # Compute loss and gradients for each batch
             for index, batch in enumerate(batches):
                 is_last_micro_batch = index == len(batches) - 1
@@ -273,8 +277,7 @@ class Trainer:
             self.scheduler.step()
             log_stats += step_stats
             self.state.step += 1
-            # The step's only GPU sync: the while condition needs tokens_seen on the CPU
-            self.state.tokens_seen += int(step_stats[2].item())
+            self.state.tokens_seen += local_input_tokens * self.world_size
             is_last_step = self.state.tokens_seen >= self.cfg.total_tokens
 
             # Log metrics
