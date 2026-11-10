@@ -20,14 +20,19 @@ class Batch(TypedDict):
     labels: Tensor
     position_ids: Tensor
 
-class RankShardedRow:
-    def __init__(self, rows: Iterable[PackedRow], rank: int, world_size: int) -> None:
-        self.rows = rows
+class RankSharded[T]:
+    """
+    Keeps every world_size-th item starting at rank, so the ranks split a stream
+    without talking to each other
+    """
+
+    def __init__(self, items: Iterable[T], rank: int, world_size: int) -> None:
+        self.items = items
         self.rank = rank
         self.world_size = world_size
 
-    def __iter__(self) -> Iterator[PackedRow]:
-        return itertools.islice((self.rows), self.rank, None, self.world_size)
+    def __iter__(self) -> Iterator[T]:
+        return itertools.islice(self.items, self.rank, None, self.world_size)
 
 
 class SequencePacker:
