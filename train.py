@@ -100,7 +100,14 @@ def parse_arguments() -> argparse.Namespace:
         "--eval-every-steps", type=int, help="default: every 10%% of training"
     )
     parser.add_argument("--eval-max-batches", type=int, help="default: whole dev set")
-    parser.add_argument("--ckpt-every-steps", type=int, help="default: only at the end")
+    parser.add_argument(
+        "--ckpt-every-steps", type=int, help="default: about every 5%% of training"
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue from the newest checkpoint in the run's checkpoint directory",
+    )
 
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints"))
     parser.add_argument(
@@ -125,6 +132,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
 
     return parser.parse_args()
+
+
+def default_ckpt_every_steps(total_steps: int, log_every_steps: int) -> int:
+    """
+    About every 5% of training, rounded down to a multiple of the log interval
+    """
+    every = total_steps // 20 // log_every_steps * log_every_steps
+    return max(every, log_every_steps)
 
 
 def pick_device(requested: str | None) -> torch.device:
@@ -191,7 +206,8 @@ def main() -> None:
         max_grad_norm=arguments.max_grad_norm,
         log_every_steps=arguments.log_every_steps,
         eval_every_steps=arguments.eval_every_steps or max(1, total_steps // 10),
-        ckpt_every_steps=arguments.ckpt_every_steps or total_steps,
+        ckpt_every_steps=arguments.ckpt_every_steps
+        or default_ckpt_every_steps(total_steps, arguments.log_every_steps),
     )
 
     tokenizer = load_tokenizer(arguments.tokenizer)
@@ -290,12 +306,24 @@ def main() -> None:
         "attention": attn_implementation,
     }
 
+    run_dir = arguments.output_dir / arguments.run_name
+    checkpointer = PretrainedCheckpointer(run_dir, tokenizer)
+    resume_from = checkpointer.latest()
+
+    # Checked before wandb starts, so a refused launch leaves no empty run behind
+    if arguments.resume and resume_from is None:
+        raise FileNotFoundError(f"--resume, but {run_dir} holds no checkpoint")
+    if not arguments.resume and resume_from is not None:
+        raise FileExistsError(
+            f"{run_dir} already holds {resume_from.name}; pass --resume to continue "
+            "it, or pick a new --run-name"
+        )
+
     if arguments.no_wandb or rank != 0:
         logger: ConsoleLogger | WandbLogger = ConsoleLogger()
     else:
         logger = WandbLogger(WANDB_PROJECT, arguments.run_name, run_config)
 
-    run_dir = arguments.output_dir / arguments.run_name
     trainer = Trainer(
         model=training_model,
         train_data=train_data,
@@ -303,10 +331,15 @@ def main() -> None:
         optimizer=optimizer,
         scheduler=scheduler,
         evaluator=evaluator,
-        ckpt=PretrainedCheckpointer(run_dir, tokenizer),
+        ckpt=checkpointer,
         logger=logger,
         cfg=training_config,
     )
+
+    if resume_from is not None:
+        trainer.load_checkpoint(resume_from)
+        if rank == 0:
+            print(f"resumed from {resume_from}")
 
     if rank == 0:
         print(f"training {total_steps} steps of {tokens_per_step:,} tokens")

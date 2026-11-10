@@ -1,9 +1,10 @@
-from transformers.utils.generic import is_flash_attention_requested
 import contextlib
+import dataclasses
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import Protocol, cast
+from pathlib import Path
+from typing import Any, Protocol, cast
 
 import torch
 from torch.nn.parallel import DistributedDataParallel
@@ -11,8 +12,9 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel
+from transformers.utils.generic import is_flash_attention_requested
 
-from .data import Batch
+from .data import Batch, Stateful
 from .loss import CausalLMLossSum
 
 
@@ -69,7 +71,12 @@ class Evaluator(Protocol):
 
 
 class Checkpointer(Protocol):
-    def save(self, trainer_state: TrainerState, model: PreTrainedModel) -> None:
+    def save(
+        self,
+        trainer_state: TrainerState,
+        model: PreTrainedModel,
+        resume_state: dict[str, Any],
+    ) -> None:
         raise NotImplementedError
 
 
@@ -322,10 +329,59 @@ class Trainer:
 
             # Checkpoints are saved on rank 0 only, the other ranks wait at the barrier
             if self.state.step % self.cfg.ckpt_every_steps == 0 or is_last_step:
-                if self.rank == 0:
-                    self.ckpt.save(self.state, self.raw_model)
-                barrier()
+                self.save_checkpoint()
                 log_start_time = time.monotonic()
+
+    def save_checkpoint(self) -> None:
+        """
+        Model, optimizer and scheduler match on every rank, so rank 0 saves one copy.
+        Only the data position differs, so it is gathered from every rank
+        """
+        data_state = cast(Stateful, self.train_data).state_dict()
+        data_states: list[Any] | None = (
+            [None] * self.world_size if self.rank == 0 else None
+        )
+
+        if torch.distributed.is_initialized():
+            torch.distributed.gather_object(data_state, data_states, dst=0)
+        else:
+            data_states = [data_state]
+
+        if self.rank == 0:
+            self.ckpt.save(
+                self.state,
+                self.raw_model,
+                {
+                    "trainer": dataclasses.asdict(self.state),
+                    "model": self.raw_model.state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                    "scheduler": self.scheduler.state_dict(),
+                    "data": data_states,
+                    "world_size": self.world_size,
+                },
+            )
+
+        barrier()
+
+    def load_checkpoint(self, path: Path) -> None:
+        """
+        Call before train(). Every rank loads, since each one steps its own optimizer
+        """
+        # CPU first: load_state_dict moves the optimizer state onto the parameters'
+        # device, and the data state's buffer has to stay on the CPU for numpy
+        state = torch.load(path / "resume.pt", map_location="cpu")
+
+        if state["world_size"] != self.world_size:
+            raise ValueError(
+                f"{path} was saved with world_size {state['world_size']}, not "
+                f"{self.world_size}; the data shards depend on it"
+            )
+
+        self.raw_model.load_state_dict(state["model"])
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.scheduler.load_state_dict(state["scheduler"])
+        cast(Stateful, self.train_data).load_state_dict(state["data"][self.rank])
+        self.state = TrainerState(**state["trainer"])
 
     def _get_batch_samples(
         self,
@@ -357,9 +413,3 @@ class Trainer:
             remaining_tokens -= batch["input_ids"].numel()
 
         return batches
-
-    def state_dict(self) -> TrainerState:
-        raise NotImplementedError
-
-    def load_state_dict(self, state_dict: TrainerState) -> None:
-        raise NotImplementedError
