@@ -247,7 +247,9 @@ def main() -> None:
 
     loss_fn = CrossEntropyLossSum()
     stream = TokenStream(store=ShardStore(arguments.data), seed=arguments.seed)
-    rows = RankSharded(SequencePacker(stream, arguments.seq_len), rank, world_size)
+    # Shard documents before packing, so each rank only packs its own 1/world_size
+    documents = RankSharded(stream, rank, world_size)
+    rows = SequencePacker(documents, arguments.seq_len)
     train_data = PackedDataLoader(rows, arguments.micro_batch_size)
 
     # Only rank 0 evaluates, so only it needs the dev set
