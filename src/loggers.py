@@ -13,7 +13,11 @@ class WandbLogger:
     ) -> None:
         # Load wandb lazily so it only have to be installed when used
         self.wandb = importlib.import_module("wandb")
-        self.run = self.wandb.init(project=project, name=name, config=config)
+        # The run name doubles as the wandb id, so a resumed run (which keeps its name)
+        # continues the same wandb run instead of starting a new one
+        self.run = self.wandb.init(
+            project=project, name=name, id=name, resume="allow", config=config
+        )
         self.console = ConsoleLogger()
 
     def log(self, data: dict[str, float], step: int) -> None:
