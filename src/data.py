@@ -2,7 +2,7 @@
 import itertools
 from collections import deque
 from collections.abc import Iterable, Iterator
-from typing import TypedDict
+from typing import Any, Protocol, TypedDict, cast
 
 import numpy
 import torch
@@ -13,6 +13,16 @@ type TokenArray = numpy.ndarray[tuple[int], numpy.dtype[numpy.int32]]
 
 # A row from sequence packer
 type PackedRow = tuple[TokenArray, list[int]]
+
+
+class Stateful(Protocol):
+    """
+    A pipeline stage whose position can be saved and restored, for resuming a run
+    """
+
+    def state_dict(self) -> dict[str, Any]: ...
+
+    def load_state_dict(self, state: dict[str, Any]) -> None: ...
 
 
 class Batch(TypedDict):
@@ -46,11 +56,25 @@ class SequencePacker:
 
         self.docs = docs
         self.seq_len = seq_len
+        # Tokens not yet emitted in a row, and the document lengths they span.
+        # Updated before each yield, so while suspended they mean "after the last row"
+        self.buffer: TokenArray = numpy.empty(0, dtype=numpy.int32)
+        self.seg_lens: deque[int] = deque()
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "docs": cast(Stateful, self.docs).state_dict(),
+            # A tensor, not an ndarray, so torch.load can keep weights_only=True
+            "buffer": torch.from_numpy(self.buffer.copy()),
+            "seg_lens": list(self.seg_lens),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        cast(Stateful, self.docs).load_state_dict(state["docs"])
+        self.buffer = state["buffer"].numpy()
+        self.seg_lens = deque(state["seg_lens"])
 
     def __iter__(self) -> Iterator[PackedRow]:
-        buffer: TokenArray = numpy.empty(0, dtype=numpy.int32)
-        seg_lens: deque[int] = deque()
-
         for doc in self.docs:
             if doc.dtype != numpy.int32:
                 raise TypeError(f"expected int32 tokens, got {doc.dtype}")
@@ -58,17 +82,13 @@ class SequencePacker:
             if doc.size == 0:
                 continue
 
-            buffer = numpy.concatenate([buffer, doc])
-            seg_lens.append(doc.size)
+            self.buffer = numpy.concatenate([self.buffer, doc])
+            self.seg_lens.append(doc.size)
 
-            start = 0
-
-            while buffer.size - start >= self.seq_len:
-                row = buffer[start : start + self.seq_len]
-                start += self.seq_len
-                yield row, self._take_row_lens(seg_lens)
-
-            buffer = buffer[start:]
+            while self.buffer.size >= self.seq_len:
+                row = self.buffer[: self.seq_len]
+                self.buffer = self.buffer[self.seq_len :]
+                yield row, self._take_row_lens(self.seg_lens)
 
     def _take_row_lens(self, seg_lens: deque[int]) -> list[int]:
         row_lens: list[int] = []
@@ -99,6 +119,14 @@ class PackedDataLoader:
 
         self.rows = rows
         self.micro_batch_size = micro_batch_size
+
+    # pending is always empty between batches, so the rows hold all the state.
+    # The trainer pulls batches synchronously, so this is the state after its last batch
+    def state_dict(self) -> dict[str, Any]:
+        return cast(Stateful, self.rows).state_dict()
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        cast(Stateful, self.rows).load_state_dict(state)
 
     def __iter__(self) -> Iterator[Batch]:
         pending: list[PackedRow] = []

@@ -9,7 +9,7 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from src.checkpoint import PretrainedCheckpointer
-from src.data import PackedDataLoader, RankSharded, SequencePacker
+from src.data import PackedDataLoader, SequencePacker
 from src.evaluation import DevelopmentEvaluator, load_development_texts
 from src.loggers import ConsoleLogger, WandbLogger
 from src.loss import CrossEntropyLossSum
@@ -246,9 +246,14 @@ def main() -> None:
         training_model.compile()
 
     loss_fn = CrossEntropyLossSum()
-    stream = TokenStream(store=ShardStore(arguments.data), seed=arguments.seed)
-    # Shard documents before packing, so each rank only packs its own 1/world_size
-    documents = RankSharded(stream, rank, world_size)
+    # The stream shards documents across ranks before packing, so each rank only
+    # packs its own 1/world_size
+    documents = TokenStream(
+        store=ShardStore(arguments.data),
+        seed=arguments.seed,
+        rank=rank,
+        world_size=world_size,
+    )
     rows = SequencePacker(documents, arguments.seq_len)
     train_data = PackedDataLoader(rows, arguments.micro_batch_size)
 
