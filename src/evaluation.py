@@ -80,6 +80,9 @@ class DevelopmentEvaluator:
         # Pack and truncate first, then shard, so the set of scored tokens
         # doesn't depend on how many GPUs the run uses
         self.batches = batches[rank::world_size]
+        # EVALDIAG: global batch index of each local batch
+        self.batch_indices = list(range(len(batches)))[rank::world_size]
+        self.rank = rank
 
     @torch.no_grad()
     def __call__(self, model: PreTrainedModel) -> EvaluationResult:
@@ -91,10 +94,17 @@ class DevelopmentEvaluator:
         # [loss_sum, num_tokens] on the GPU, float64 like log_stats
         totals = torch.zeros(2, dtype=torch.float64, device=device)
 
-        for batch in self.batches:
+        checksum = sum(p.detach().double().sum().item() for p in model.parameters())
+        print(f"EVALDIAG checksum rank={self.rank} {checksum!r}", flush=True)
+
+        for index, batch in zip(self.batch_indices, self.batches):
             logits, labels = forward_batch(model, batch, device, varlen)
             batch_loss_sum, batch_num_tokens = self.loss_fn(logits, labels)
             del logits
+            print(
+                f"EVALDIAG batch {index} {batch_loss_sum.item()!r} {batch_num_tokens.item()}",
+                flush=True,
+            )
             totals[0] += batch_loss_sum
             totals[1] += batch_num_tokens
 
