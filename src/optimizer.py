@@ -41,6 +41,12 @@ class CombinedOptimizer(Optimizer):
         ):
             optimizer.load_state_dict(inner_state)
 
+        # Optimizer.load_state_dict swaps in new group dicts. Point at them again,
+        # or the scheduler keeps updating the old dicts and the lr stops changing
+        self.param_groups = [
+            group for optimizer in self.optimizers for group in optimizer.param_groups
+        ]
+
 
 def build_muon_adamw(
     model: nn.Module,
