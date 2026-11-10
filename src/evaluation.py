@@ -9,7 +9,12 @@ from transformers import PreTrainedModel, PreTrainedTokenizerFast
 
 from .data import Batch, PackedDataLoader, SequencePacker, TokenArray
 from .loss import CausalLMLossSum
-from .trainer import EvaluationResult, forward_batch, uses_varlen_attention
+from .trainer import (
+    EvaluationResult,
+    all_reduce_sum,
+    forward_batch,
+    uses_varlen_attention,
+)
 
 
 def load_development_texts(repository_id: str) -> list[str]:
@@ -46,6 +51,8 @@ class DevelopmentEvaluator:
         seq_len: int,
         micro_batch_size: int,
         max_batches: int | None = None,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         texts = load_development_texts(repository_id)
         encoded = tokenizer(
@@ -61,15 +68,18 @@ class DevelopmentEvaluator:
         ]
 
         rows = SequencePacker(documents, seq_len)
-        self.batches: list[Batch] = list(PackedDataLoader(rows, micro_batch_size))
+        batches: list[Batch] = list(PackedDataLoader(rows, micro_batch_size))
 
         if max_batches is not None:
-            self.batches = self.batches[:max_batches]
+            batches = batches[:max_batches]
 
-        if not self.batches:
+        if not batches:
             raise ValueError("the dev set is too small for one batch")
 
         self.loss_fn = loss_fn
+        # Pack and truncate first, then shard, so the set of scored tokens
+        # doesn't depend on how many GPUs the run uses
+        self.batches = batches[rank::world_size]
 
     @torch.no_grad()
     def __call__(self, model: PreTrainedModel) -> EvaluationResult:
@@ -78,15 +88,18 @@ class DevelopmentEvaluator:
         device = model.device
         varlen = uses_varlen_attention(model)
 
-        loss_sum = 0.0
-        num_tokens = 0
+        # [loss_sum, num_tokens] on the GPU, float64 like log_stats
+        totals = torch.zeros(2, dtype=torch.float64, device=device)
 
         for batch in self.batches:
             logits, labels = forward_batch(model, batch, device, varlen)
             batch_loss_sum, batch_num_tokens = self.loss_fn(logits, labels)
             del logits
-            loss_sum += batch_loss_sum.item()
-            num_tokens += int(batch_num_tokens.item())
+            totals[0] += batch_loss_sum
+            totals[1] += batch_num_tokens
+
+        all_reduce_sum(totals)
+        loss_sum, num_tokens = totals.tolist()  # the only GPU sync in eval
 
         if was_training:
             model.train()

@@ -10,13 +10,13 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from src.checkpoint import PretrainedCheckpointer
 from src.data import PackedDataLoader, RankSharded, SequencePacker
-from src.evaluation import DevelopmentEvaluator
+from src.evaluation import DevelopmentEvaluator, load_development_texts
 from src.loggers import ConsoleLogger, WandbLogger
 from src.loss import CrossEntropyLossSum
 from src.optimizer import build_muon_adamw, build_warmup_stable_decay
 from src.token_stream import TokenStream
 from src.tokenizer import ShardStore, load_tokenizer
-from src.trainer import Trainer, TrainingConfig
+from src.trainer import Trainer, TrainingConfig, barrier
 
 TOKENIZER_NAME = "meta-llama/Llama-3.2-1B"
 DEVELOPMENT_DATASET = "cerulean-works/fineweb-edu-dev"
@@ -252,17 +252,22 @@ def main() -> None:
     rows = SequencePacker(documents, arguments.seq_len)
     train_data = PackedDataLoader(rows, arguments.micro_batch_size)
 
-    # Only rank 0 evaluates, so only it needs the dev set
-    evaluator: DevelopmentEvaluator | None = None
+    # Every rank evaluates its share of the dev set, so every rank needs an evaluator:
+    # a rank without one would skip the eval all-reduce and hang the others.
+    # Rank 0 downloads the dev set first, so the other ranks read it from the HF cache
     if rank == 0:
-        evaluator = DevelopmentEvaluator(
-            tokenizer,
-            arguments.development_dataset,
-            loss_fn,
-            seq_len=arguments.seq_len,
-            micro_batch_size=arguments.micro_batch_size,
-            max_batches=arguments.eval_max_batches,
-        )
+        load_development_texts(arguments.development_dataset)
+    barrier()
+    evaluator = DevelopmentEvaluator(
+        tokenizer,
+        arguments.development_dataset,
+        loss_fn,
+        seq_len=arguments.seq_len,
+        micro_batch_size=arguments.micro_batch_size,
+        max_batches=arguments.eval_max_batches,
+        rank=rank,
+        world_size=world_size,
+    )
 
     run_config: dict[str, object] = {
         **vars(arguments),

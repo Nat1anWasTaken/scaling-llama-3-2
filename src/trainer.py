@@ -303,22 +303,24 @@ class Trainer:
                 log_stats.zero_()
                 log_start_time = time.monotonic()
 
-            # Eval and checkpoint run on rank 0 with the unwrapped model, the other ranks
-            # wait at the barrier. The DDP wrapper would block in its buffer broadcast
+            # Every rank evaluates its share of the dev set with the unwrapped model, since
+            # the DDP wrapper would broadcast buffers on every forward. The evaluator's
+            # all-reduce already syncs the ranks, so eval needs no barrier
             if self.state.step % self.cfg.eval_every_steps == 0 or is_last_step:
-                if self.rank == 0 and self.evaluator is not None:
+                if self.evaluator is not None:
                     result = self.evaluator(self.raw_model)
-                    self.logger.log(
-                        {
-                            "eval/loss": result.loss,
-                            "eval/perplexity": result.perplexity,
-                        },
-                        step=self.state.step,
-                    )
-                barrier()
+                    if self.rank == 0:
+                        self.logger.log(
+                            {
+                                "eval/loss": result.loss,
+                                "eval/perplexity": result.perplexity,
+                            },
+                            step=self.state.step,
+                        )
                 # Don't count eval time as training throughput
                 log_start_time = time.monotonic()
 
+            # Checkpoints are saved on rank 0 only, the other ranks wait at the barrier
             if self.state.step % self.cfg.ckpt_every_steps == 0 or is_last_step:
                 if self.rank == 0:
                     self.ckpt.save(self.state, self.raw_model)
