@@ -260,7 +260,7 @@ def main() -> None:
     # Compile after wrapping, so dynamo sees DDP and keeps all-reduce overlapped with backward
     if arguments.compile:
         training_model.compile()
-        # EXPERIMENT: eval runs on the unwrapped model, which the DDP compile above
+        # eval runs on the unwrapped model, which the DDP compile above
         # doesn't cover. Compile it too, so eval uses the same kernels as on 1 GPU
         if training_model is not model:
             model.compile()

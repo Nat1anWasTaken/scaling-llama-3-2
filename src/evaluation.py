@@ -80,7 +80,7 @@ class DevelopmentEvaluator:
         # Pack and truncate first, then shard, so the set of scored tokens
         # doesn't depend on how many GPUs the run uses
         self.batches = batches[rank::world_size]
-        # EVALDIAG: global batch index of each local batch
+        # global batch index of each local batch
         self.batch_indices = list(range(len(batches)))[rank::world_size]
         self.rank = rank
 
