@@ -55,7 +55,6 @@ def build_muon_adamw(
     adamw_betas: tuple[float, float],
 ) -> CombinedOptimizer:
     muon_parameters = []
-    adamw_decay_parameters = []
     adamw_no_decay_parameters = []
 
     for name, parameter in model.named_parameters():
@@ -64,10 +63,9 @@ def build_muon_adamw(
 
         if parameter.ndim == 2 and ".layers." in f".{name}":
             muon_parameters.append(parameter)
-        elif parameter.ndim == 2:
-            # the embedding & the output layer
-            adamw_decay_parameters.append(parameter)
         else:
+            # Experiment: the (tied) embedding & output layer get no weight decay,
+            # same as the norm gains
             adamw_no_decay_parameters.append(parameter)
 
     muon = Muon(
@@ -78,11 +76,6 @@ def build_muon_adamw(
     )
     adamw = AdamW(
         [
-            {
-                "params": adamw_decay_parameters,
-                "weight_decay": weight_decay,
-                "name": "adamw",
-            },
             {
                 "params": adamw_no_decay_parameters,
                 "weight_decay": 0.0,
