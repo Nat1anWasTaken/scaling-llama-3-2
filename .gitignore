@@ -8,3 +8,26 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets (wandb / HF / S3 credentials)
+.env
+.env.*
+
+# Training outputs
+checkpoints/
+wandb/
+logs/
+*.pt
+*.safetensors
+
+# Local data shards (prepare.py with a local --output)
+*.npy
+
+# Tooling / editor caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
