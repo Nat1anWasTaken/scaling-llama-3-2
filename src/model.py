@@ -1,5 +1,5 @@
 import math
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -114,11 +114,12 @@ class LlamaCausalLM(LlamaForCausalLM):
                 if k not in MUP_CONFIG_KEYS
             }
         )
-        plain = LlamaForCausalLM(plain_config).to(self.device)
+        plain = LlamaForCausalLM(plain_config)
         plain.load_state_dict(self.state_dict())
 
         # The branches are linear with no bias, so 1/m_L folds into their last weight
         for layer in plain.model.layers:
+            layer = cast(LlamaDecoderLayer, layer)
             layer.self_attn.o_proj.weight.div_(self.depth_multiplier)
             layer.mlp.down_proj.weight.div_(self.depth_multiplier)
 
