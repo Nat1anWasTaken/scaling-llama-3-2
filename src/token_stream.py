@@ -26,7 +26,7 @@ class TokenStream:
         self.seed = seed
         self.rank = rank
         self.world_size = world_size
-        self.shard_names = [f"{shard['fragment_id']:06d}" for shard in shards]
+        self.shard_names = [shard["name"] for shard in shards]
 
         # The next document to read: which shard, and where in that shard's permutation
         self.shard_index = 0
@@ -73,7 +73,9 @@ class TokenStream:
                     )
 
                 # Every rank draws the same permutations in the same order, so all ranks
-                # agree on the global document sequence, and a resumed run redraws it
+                # agree on the global document sequence, and a resumed run redraws it.
+                # This is the last step of prepare.py's global shuffle: shards store
+                # their documents in fragment order, so it must not be removed
                 order = random_generator.permutation(offsets.size - 1)
 
                 while self.position < order.size:
