@@ -28,5 +28,10 @@ dev = [
     "ty>=0.0.97",
 ]
 
+[tool.ty.rules]
+# torch declares `nn.Module.forward: Callable[..., Any]`, so ty flags every `def forward`
+# override as writing to a mutable attribute. Not a real error for nn.Module subclasses
+invalid-mutable-override = "ignore"
+
 [tool.ruff.lint]
 extend-select = ["ANN", "N"]

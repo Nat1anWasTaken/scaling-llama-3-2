@@ -8,6 +8,7 @@ from typing import Any
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 
+from .model import LlamaCausalLM
 from .trainer import TrainerState
 
 STEP_DIR_PATTERN = re.compile(r"step-(\d+)")
@@ -29,8 +30,14 @@ class PretrainedCheckpointer:
         shutil.rmtree(partial_dir, ignore_errors=True)
         partial_dir.mkdir(parents=True)
 
-        # HF format for uploading and Flock eval, resume.pt for continuing the run
-        model.save_pretrained(partial_dir)
+        # HF format for uploading and Flock eval, resume.pt for continuing the run.
+        # The HF dir gets the muP/CompleteP multipliers folded into a plain Llama, since a
+        # stock loader never runs our forward. resume.pt keeps the unfolded weights
+        hf_model = (
+            model.export_plain_llama() if isinstance(model, LlamaCausalLM) else model
+        )
+        hf_model.save_pretrained(partial_dir)
+        del hf_model
         self.tokenizer.save_pretrained(partial_dir)
         torch.save(resume_state, partial_dir / "resume.pt")
         (partial_dir / "trainer_state.json").write_text(

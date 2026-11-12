@@ -6,13 +6,13 @@ from collections import namedtuple
 from pathlib import Path
 
 import torch
-from transformers import LlamaConfig, LlamaForCausalLM
 
 from src.checkpoint import PretrainedCheckpointer
 from src.data import PackedDataLoader, SequencePacker
 from src.evaluation import DevelopmentEvaluator, load_development_texts
 from src.loggers import ConsoleLogger, WandbLogger
 from src.loss import CrossEntropyLossSum
+from src.model import LlamaCausalLM, ScalingLlamaConfig
 from src.optimizer import build_muon_adamw, build_warmup_stable_decay
 from src.token_stream import TokenStream
 from src.tokenizer import ShardStore, load_tokenizer
@@ -87,10 +87,27 @@ def parse_arguments() -> argparse.Namespace:
         help="tokens per optimizer step summed over all ranks (default: 4,194,304)",
     )
 
-    parser.add_argument("--learning-rate", type=float, default=3e-3)
-    parser.add_argument("--weight-decay", type=float, default=0.1)
+    # muP: hyperparameters are tuned on --mup-base-size and transferred. Muon's lr is in
+    # spectral units (update spectral norm per step), not comparable to the AdamW lr
+    parser.add_argument(
+        "--mup-base-size",
+        choices=MODEL_SIZES,
+        help="model size whose hyperparameters this run transfers from (default: none, "
+        "i.e. plain SP with every multiplier at 1)",
+    )
+    parser.add_argument("--embedding-multiplier", type=float, default=1.0)
+    parser.add_argument("--muon-lr", type=float, default=0.02)
+    parser.add_argument("--adamw-lr", type=float, default=3e-3)
+    parser.add_argument(
+        "--muon-weight-decay",
+        type=float,
+        default=0.015,
+        help="per-step hidden decay is muon_lr * this, scaled by 1 / m_in per matrix",
+    )
+    parser.add_argument("--adamw-weight-decay", type=float, default=0.1)
     parser.add_argument("--adamw-beta1", type=float, default=0.9)
     parser.add_argument("--adamw-beta2", type=float, default=0.95)
+    parser.add_argument("--adamw-eps", type=float, default=1e-12)
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--decay-fraction", type=float, default=0.2)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -153,9 +170,19 @@ def pick_device(requested: str | None) -> torch.device:
 
 
 def build_model_config(
-    size: ModelSize, seq_len: int, bos_token_id: int, eos_token_id: int
-) -> LlamaConfig:
-    return LlamaConfig(
+    size: ModelSize,
+    base_size: ModelSize | None,
+    embedding_multiplier: float,
+    seq_len: int,
+    bos_token_id: int,
+    eos_token_id: int,
+) -> ScalingLlamaConfig:
+    base_size = base_size or size
+    return ScalingLlamaConfig(
+        base_hidden_size=base_size.hidden_size,
+        base_intermediate_size=base_size.intermediate_size,
+        base_num_hidden_layers=base_size.num_layers,
+        embedding_multiplier=embedding_multiplier,
         vocab_size=VOCAB_SIZE,
         hidden_size=size.hidden_size,
         intermediate_size=size.intermediate_size,
@@ -218,11 +245,13 @@ def main() -> None:
 
     model_config = build_model_config(
         MODEL_SIZES[arguments.model_size],
+        MODEL_SIZES[arguments.mup_base_size] if arguments.mup_base_size else None,
+        arguments.embedding_multiplier,
         arguments.seq_len,
         bos_token_id,
         eos_token_id,
     )
-    model = LlamaForCausalLM(model_config).to(device)
+    model = LlamaCausalLM(model_config).to(device)
 
     # FA3 needs Hopper-class CUDA GPUs, so CPU and MPS debug runs fall back to SDPA
     attn_implementation = arguments.attn_implementation or (
@@ -238,9 +267,12 @@ def main() -> None:
 
     optimizer = build_muon_adamw(
         model,
-        learning_rate=arguments.learning_rate,
-        weight_decay=arguments.weight_decay,
+        muon_lr=arguments.muon_lr,
+        adamw_lr=arguments.adamw_lr,
+        muon_weight_decay=arguments.muon_weight_decay,
+        adamw_weight_decay=arguments.adamw_weight_decay,
         adamw_betas=(arguments.adamw_beta1, arguments.adamw_beta2),
+        adamw_eps=arguments.adamw_eps,
     )
     scheduler = build_warmup_stable_decay(
         optimizer,
@@ -304,8 +336,15 @@ def main() -> None:
         "grad_accum_steps": grad_accum_steps,
         "total_steps": total_steps,
         "training": dataclasses.asdict(training_config),
-        "initialization": f"HF default, normal(0, {model_config.initializer_range})",
-        "optimizer": "Muon(match_rms_adamw) for decoder 2D weights, AdamW otherwise",
+        "initialization": (
+            f"muP: hidden normal(0, {model_config.initializer_range} * sqrt(base_fan_in "
+            "/ fan_in)), embedding constant std; logits * base_d / d, residual branches "
+            "* base_L / L (CompleteP alpha=1), embedding * embedding_multiplier"
+        ),
+        "optimizer": (
+            "Muon(spectral_unclamped) for decoder 2D weights with wd / m_in, "
+            "AdamW for the tied embedding and RMSNorm gains"
+        ),
         "schedule": "linear warmup, constant, linear decay to 0 (WSD)",
         "attention": attn_implementation,
     }
