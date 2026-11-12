@@ -1,3 +1,4 @@
+import io
 import json
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
@@ -82,7 +83,9 @@ class ShardStore:
     def _load(self, path: PurePosixPath) -> numpy.ndarray:
         # open_input_file, not open_input_stream: numpy.load needs to seek
         with self.filesystem.open_input_file(str(path)) as file:
-            return numpy.load(file, allow_pickle=False)
+            data = file.read()
+
+        return numpy.load(io.BytesIO(data), allow_pickle=False)
 
 
 def load_tokenizer(name: str) -> PreTrainedTokenizerFast:
