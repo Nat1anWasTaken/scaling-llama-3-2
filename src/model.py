@@ -57,6 +57,13 @@ class LlamaCausalLM(LlamaForCausalLM):
         # generic _init_weights, so ours would only ever see lm_head. Apply ours everywhere
         self.apply(self._init_weights)
 
+        # Every residual branch starts at exactly 0 (as in the CompleteP + Muon reference
+        # code), so h_L = embedding at init and the stream carries no depth-dependent noise
+        for layer in self.model.layers:
+            assert isinstance(layer, LlamaDecoderLayer)
+            nn.init.zeros_(layer.self_attn.o_proj.weight)
+            nn.init.zeros_(layer.mlp.down_proj.weight)
+
     def _init_weights(self, module: nn.Module) -> None:
         std = self.config.initializer_range
 
