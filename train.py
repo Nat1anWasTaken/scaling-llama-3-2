@@ -108,7 +108,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--adamw-beta1", type=float, default=0.9)
     parser.add_argument("--adamw-beta2", type=float, default=0.95)
     parser.add_argument("--adamw-eps", type=float, default=1e-12)
-    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--decay-fraction", type=float, default=0.2)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
 
