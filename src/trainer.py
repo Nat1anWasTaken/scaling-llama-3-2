@@ -8,7 +8,7 @@ from typing import Any, Protocol, cast
 
 import torch
 from torch.nn.parallel import DistributedDataParallel
-from torch.nn.utils import clip_grad_norm_
+from torch.nn.utils import clip_grads_with_norm_
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel
@@ -16,6 +16,11 @@ from transformers.utils.generic import is_flash_attention_requested
 
 from .data import Batch, Stateful
 from .loss import CausalLMLossSum
+from .param_stats import ParameterStats
+
+# Positions of the first micro batch whose logsumexp is logged. Their fp32 copy is
+# LOGIT_SAMPLE x vocab (~0.5 GB), against ~17 GB for the whole micro batch
+LOGIT_SAMPLE = 1024
 
 
 @dataclass
@@ -200,15 +205,20 @@ class Trainer:
         self.logger = logger
         self.cfg = cfg
         self.state = TrainerState()
+        # DDP raises on parameters that get no gradient, so every one of these has a grad
+        self.params = [p for p in self.raw_model.parameters() if p.requires_grad]
+        # Gradients match on every rank after the all-reduce, so only rank 0 measures them
+        self.param_stats = ParameterStats(self.raw_model) if self.rank == 0 else None
 
     def train(self) -> None:
         self.model.train()
         train_iter = iter(self.train_data)
         device = self.device
 
-        # [loss_sum, loss_tokens, input_tokens] summed over all ranks since the last log.
+        # [loss_sum, loss_tokens, input_tokens] summed over all ranks since the last log,
+        # then [clipped_steps, steps] counted since the last log.
         # float64: token counts reach 1e10, past where float32 holds integers exactly
-        log_stats = torch.zeros(3, dtype=torch.float64, device=device)
+        log_stats = torch.zeros(5, dtype=torch.float64, device=device)
         log_start_time = time.monotonic()
 
         while self.state.tokens_seen < self.cfg.total_tokens:
@@ -233,6 +243,15 @@ class Trainer:
             # Every rank trims its batches the same way, so all ranks see the same count
             local_input_tokens = sum(batch["input_ids"].numel() for batch in batches)
 
+            # Decided up front, since the extra log stats are gathered during the step
+            next_tokens_seen = self.state.tokens_seen + local_input_tokens * self.world_size
+            is_last_step = next_tokens_seen >= self.cfg.total_tokens
+            is_log_step = (
+                self.state.step + 1
+            ) % self.cfg.log_every_steps == 0 or is_last_step
+            stats = self.param_stats if is_log_step else None
+            logit_stats: torch.Tensor | None = None
+
             # Compute loss and gradients for each batch
             for index, batch in enumerate(batches):
                 is_last_micro_batch = index == len(batches) - 1
@@ -250,6 +269,14 @@ class Trainer:
                     )
                     loss_sum, num_loss_tokens = self.loss_fn(logits, labels)
                     loss_sum.backward()
+
+                # Logit scale, to watch the 1/m_d readout: max over the micro batch (exact
+                # in bf16, so no copy) and mean logsumexp over LOGIT_SAMPLE positions
+                if stats is not None and index == 0:
+                    with torch.no_grad():
+                        flat = logits.detach().reshape(-1, logits.shape[-1])
+                        logsumexp = flat[:LOGIT_SAMPLE].float().logsumexp(-1).mean()
+                        logit_stats = torch.stack([logsumexp, flat.amax().float()])
 
                 # Free the logits now, a for loop keeps them alive until the next forward returns
                 del logits
@@ -273,33 +300,65 @@ class Trainer:
 
             # Clip gradients and update model
             # Every rank holds the same gradients after the all-reduce, so the norm matches too.
-            # The norm stays a tensor and is only read back when logging
+            # This is clip_grad_norm_ split in two, keeping the per-parameter norms it
+            # computes anyway for the log. The norms stay tensors until logging
             max_norm = float("inf")
             if self.cfg.max_grad_norm is not None:
                 max_norm = self.cfg.max_grad_norm
-            grad_norm = clip_grad_norm_(self.raw_model.parameters(), max_norm=max_norm)
+            grads = [p.grad for p in self.params]
+            grad_norms = torch.stack(torch._foreach_norm(grads, dtype=torch.float32))
+            grad_norm = torch.linalg.vector_norm(grad_norms)
+            clip_grads_with_norm_(self.params, max_norm, grad_norm)
 
             # Next step
+            weights_before = stats.snapshot() if stats is not None else None
             self.optimizer.step()
             self.scheduler.step()
-            log_stats += step_stats
-            self.state.step += 1
-            self.state.tokens_seen += local_input_tokens * self.world_size
-            is_last_step = self.state.tokens_seen >= self.cfg.total_tokens
+            param_norms = None
+            if stats is not None and weights_before is not None:
+                param_norms = stats.norms(weights_before, grad_norms)
+            del weights_before
 
-            # Log metrics
-            # Note that we only log metrics at the end of each log_every_steps interval or when we reach total_tokens
-            if self.state.step % self.cfg.log_every_steps == 0 or is_last_step:
+            log_stats[:3] += step_stats
+            log_stats[3] += grad_norm > max_norm
+            log_stats[4] += 1
+            self.state.step += 1
+            self.state.tokens_seen = next_tokens_seen
+
+            # Log metrics at the end of each log_every_steps interval and at the last step
+            if is_log_step:
                 if self.rank == 0:
-                    log_loss_sum, log_loss_tokens, log_input_tokens = log_stats.tolist()
+                    # One GPU -> CPU copy for every value of this log
+                    parts = [log_stats, grad_norm.reshape(1)]
+                    if logit_stats is not None:
+                        parts.append(logit_stats)
+                    if param_norms is not None:
+                        parts.append(param_norms.flatten())
+                    values = torch.cat([t.double() for t in parts]).tolist()
+
+                    (
+                        log_loss_sum,
+                        log_loss_tokens,
+                        log_input_tokens,
+                        log_clipped_steps,
+                        log_steps,
+                        grad_norm_value,
+                    ) = values[:6]
+                    rest = values[6:]
                     elapsed = time.monotonic() - log_start_time
                     metrics = {
                         "train/loss": log_loss_sum / log_loss_tokens,
-                        "train/grad_norm": grad_norm.item(),
+                        "train/grad_norm": grad_norm_value,
+                        "train/clip_fraction": log_clipped_steps / log_steps,
                         "train/step": self.state.step,
                         "train/tokens_per_second": log_input_tokens / elapsed,
                         "train/total_tokens_seen": self.state.tokens_seen,
                     }
+                    if logit_stats is not None:
+                        metrics["train/logits/logsumexp"], metrics["train/logits/max"] = rest[:2]
+                        rest = rest[2:]
+                    if self.param_stats is not None and param_norms is not None:
+                        metrics.update(self.param_stats.to_metrics(rest))
                     # One learning rate per param group, named when the group has a name
                     for index, group in enumerate(self.optimizer.param_groups):
                         name = group.get("name", str(index))
