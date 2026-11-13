@@ -3,21 +3,23 @@ Pre-tokenize FineWeb-Edu into globally shuffled shards, until a token budget.
 
     eval "$(flock s3 credentials --ttl 24h)"
     uv run prepare.py --output s3://<bucket>/fineweb-edu-llama3 --token-budget 30000000000 \\
+        --fragments /work/<user>/fragments/fineweb-edu-llama3 \\
         --run-name prepare-fineweb-edu-llama3
 
 A two-pass shuffle:
   1. Tokenize fragments in a fixed shuffled order until the budget. Every document draws
-     a bucket uniformly at random, and each fragment is stored sorted by bucket under
-     fragments/.
+     a bucket uniformly at random, and each fragment is stored sorted by bucket in the
+     --fragments directory (default <output>/fragments). Phase 2 reads small slices of
+     every fragment, so a shared filesystem is much faster for it than S3.
   2. Gather each bucket's documents from every fragment into one output shard.
 TokenStream then permutes the documents inside each shard. Uniform buckets plus a
 uniform permutation inside each bucket make the whole document order uniformly random,
 so any prefix of the shards is a uniform sample of the data.
 
 Rerunning with the same --output skips finished fragments and shards, so an interrupted
-run (or an expired S3 key) only needs a rerun. The bucket count comes from the budget,
-so a different budget needs a different --output. fragments/ can be deleted once
-manifest.json is written.
+run (or an expired S3 key) only needs a rerun with the same --fragments. The bucket
+count comes from the budget, so a different budget needs a different --output and
+--fragments. The --fragments directory can be deleted once manifest.json is written.
 """
 
 import argparse
@@ -60,7 +62,7 @@ def initialize_tokenizer(
     dataset_uri: str,
     tokenizer_name: str,
     exclude_ids: frozenset[str],
-    output_uri: str,
+    fragments_uri: str,
     seed: int,
     num_buckets: int,
     batch_size: int,
@@ -74,7 +76,7 @@ def initialize_tokenizer(
         open_dataset(dataset_uri),
         load_tokenizer(tokenizer_name),
         exclude_ids,
-        ShardStore(output_uri),
+        ShardStore(fragments_uri),
         seed,
         num_buckets,
         batch_size,
@@ -89,12 +91,15 @@ def tokenize_fragment(fragment_id: int) -> tuple[int, int, Offsets]:
 
 
 def initialize_gatherer(
-    output_uri: str, fragment_names: list[str], bucket_offsets: Offsets
+    fragments_uri: str,
+    output_uri: str,
+    fragment_names: list[str],
+    bucket_offsets: Offsets,
 ) -> None:
     global gatherer_worker
 
     gatherer_worker = BucketGatherer(
-        ShardStore(output_uri), fragment_names, bucket_offsets
+        ShardStore(fragments_uri), ShardStore(output_uri), fragment_names, bucket_offsets
     )
 
 
@@ -127,6 +132,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--output", required=True, help="local path or s3://bucket/prefix"
     )
+    parser.add_argument(
+        "--fragments",
+        help="local path or s3://bucket/prefix for the phase 1 fragments; "
+        "default <output>/fragments",
+    )
     parser.add_argument("--token-budget", type=int, required=True)
     parser.add_argument(
         "--shard-tokens",
@@ -148,6 +158,9 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> None:
     arguments = parse_arguments()
     store = ShardStore(arguments.output)
+    fragment_store = ShardStore(
+        arguments.fragments or arguments.output.rstrip("/") + "/fragments"
+    )
     dataset = open_dataset(arguments.dataset)
 
     num_buckets = math.ceil(arguments.token_budget / arguments.shard_tokens)
@@ -164,6 +177,8 @@ def main() -> None:
         "num_buckets": num_buckets,
     }
     check_metadata(store, metadata)
+    # Fragments are also skipped by name, and --fragments can point anywhere
+    check_metadata(fragment_store, metadata)
 
     if arguments.no_wandb:
         logger: ConsoleLogger | WandbLogger = ConsoleLogger()
@@ -195,7 +210,7 @@ def main() -> None:
             arguments.dataset,
             arguments.tokenizer,
             exclude_ids,
-            store.uri,
+            fragment_store.uri,
             arguments.seed,
             num_buckets,
             arguments.batch_size,
@@ -238,6 +253,7 @@ def main() -> None:
         arguments.workers,
         initializer=initialize_gatherer,
         initargs=(
+            fragment_store.uri,
             store.uri,
             [fragment_shard_name(fragment["fragment_id"]) for fragment in fragments],
             numpy.stack(bucket_offsets),

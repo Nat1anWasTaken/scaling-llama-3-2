@@ -127,10 +127,10 @@ class ShardStore:
 
 def fragment_shard_name(fragment_id: int) -> str:
     """
-    Where phase 1 of the global shuffle puts a tokenized fragment, apart from the
-    output shards that TokenStream reads
+    Where phase 1 of the global shuffle puts a tokenized fragment inside the fragment
+    store, which is kept apart from the output shards that TokenStream reads
     """
-    return f"fragments/{fragment_id:06d}"
+    return f"{fragment_id:06d}"
 
 
 def load_tokenizer(name: str) -> PreTrainedTokenizerFast:
@@ -308,12 +308,17 @@ class BucketGatherer:
     """
 
     def __init__(
-        self, store: ShardStore, fragment_names: list[str], bucket_offsets: Offsets
+        self,
+        fragment_store: ShardStore,
+        store: ShardStore,
+        fragment_names: list[str],
+        bucket_offsets: Offsets,
     ) -> None:
         # bucket_offsets has shape [num_fragments, num_buckets + 1]
         if bucket_offsets.shape[0] != len(fragment_names):
             raise ValueError("need one row of bucket_offsets per fragment")
 
+        self.fragment_store = fragment_store
         self.store = store
         self.fragment_names = fragment_names
         self.bucket_offsets = bucket_offsets
@@ -336,9 +341,11 @@ class BucketGatherer:
                 continue
 
             # stop - start documents are bounded by stop - start + 1 offsets
-            offsets = self.store.read_offsets_slice(fragment_name, start, stop + 1)
+            offsets = self.fragment_store.read_offsets_slice(
+                fragment_name, start, stop + 1
+            )
             token_parts.append(
-                self.store.read_tokens_slice(
+                self.fragment_store.read_tokens_slice(
                     fragment_name, int(offsets[0]), int(offsets[-1])
                 )
             )
