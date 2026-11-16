@@ -65,6 +65,10 @@ MODEL_SIZES = {
     "500M": ModelSize(11, 1536, 4672, 24, 6),
     "750M": ModelSize(13, 1792, 5888, 28, 7),
     "1B": ModelSize(15, 1792, 8000, 28, 7),
+    # LR-transfer variants of 150M: width only, depth only, both (use --mup-base-size 150M)
+    "150M-wide": ModelSize(6, 1024, 4096, 16, 4),
+    "150M-deep": ModelSize(10, 768, 3072, 12, 3),
+    "150M-wide-deep": ModelSize(10, 1024, 4096, 16, 4),
 }
 
 
